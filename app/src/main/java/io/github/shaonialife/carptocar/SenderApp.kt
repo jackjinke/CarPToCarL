@@ -22,23 +22,30 @@ import io.github.shaonialife.carptocar.video.VideoCanvasMode
 class SenderApp : Application() {
     override fun onCreate() {
         super.onCreate()
-        // 会话日志起点标记：日志文件跨进程累积（2MB 上限），导出默认只取本次启动
-        // 之后的部分。必须在这里写（Application 是进程最早入口），晚于任何业务日志
-        // 都会让它被算进「历史」。
+        // 进程标记与实际安装版本一起写入，跨重启导出才能区分旧构建的失败。
         DebugFileLog.markSessionStart(this)
+        DebugFileLog.append(
+            this,
+            "BUILD: ${io.github.shaonialife.carptocar.util.AppVersion.nameWithTag(this)} " +
+                "pid=${android.os.Process.myPid()} startupEpochMs=${System.currentTimeMillis()} " +
+                "upstream=7c55ac0 diagnostics=session10",
+        )
         // VideoConfig 画布声明模式（车机画布 / 码流尺寸）——会话建立时读一次
         VideoCanvasMode.load(this)
         // 首帧策略（缓存关键帧立即起播 / 等引擎当期 IDR）——attach 时读一次
         FirstFramePolicy.load(this)
         // 「使用车机 GPS」开关（默认开）——iAP2 收帧线程每秒会读，启动时载入一次即可
         CarGpsOption.load(this)
-        // 完整会话报文录制（files/session_trace.log）：与上面的过程日志分开两份文件，
-        // 原因见 SessionTrace 注释（报文量大会挤掉过程日志）。必须在业务起来之前 attach。
+        // 会话控制面录制（files/session_trace_<process>_<seq>.log），保留建链后断开的现场。
+        // 在业务启动前 attach；生命周期快照后台写入，运行过程另记 main_debug.log。
         SessionTrace.attach(this)
-        val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             Log.e(TAG, "未捕获异常（线程 ${thread.name}，已吞掉保进程）", throwable)
-            // 不调用 previous：默认处理器会 killProcess 杀死整个 app
+            DebugFileLog.append(
+                this,
+                "UNCAUGHT: thread=${thread.name} ${throwable.stackTraceToString().take(8192)}",
+            )
+            // 保持现有的线程异常策略；额外写入文件供离车导出诊断。
         }
         // 应用安装/卸载/更新 → 桌面与车机设置的共享应用清单缓存失效
         val packageFilter =

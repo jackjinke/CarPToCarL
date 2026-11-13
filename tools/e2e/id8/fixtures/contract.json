@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "role": "Independent network peer for the real Android app; not a BMW software/UI emulator",
+  "oracle": {
+    "inputs": "Only actual TCP/UDP traffic, generated source video/PCM and normal lifecycle driver commands",
+    "forbidden": ["app ready flags", "app media counters", "log-string success", "reflection", "publishing internal media state", "importing app parsers or tools/mock"],
+    "authentication": "SRP-6a 3072/SHA512 client proof, X25519/Ed25519 verification, independent control/event ChaCha20-Poly1305 keys and record counters",
+    "iap": "DETECT/SYN/checksums/control framing, advertised AA06 serial selector, bare full-certificate request, outstanding challenge, nonempty response before AA05 and post-auth AD00/AD01 app discovery. Negotiated RECORD is accepted independently of iAP completion; oracle requires completion separately. The iap-window case independently enforces the negotiated five-payload receive window even with zero retries, delaying cumulative ACKs150ms.",
+    "resources": "Initial car-owned screen/audio, observed take500/borrow100; idle source must not displace radio; source play may take; navigation may only borrow; car reclaim suppresses same-episode reacquisition",
+    "video": "Independently decoded H264 SPS/PPS and IDR start; visible source must remain2560x800 independently of receiver display2662x812; encrypted frames authenticate full header and sequential nonce; decoded color changes only after source touch and moving stripe must progress",
+    "audio": "Independently decrypt RTP timestamp/SSRC AAD, reject nonce replay and sequence discontinuity, require AAC RTP clock1024 samples/packet, reject packets before the individual stream's RECORD, decode AAC or big-endian PCM and verify non-silent content. Concurrent music/navigation must share each100ms decoded waveform window under one wall-clock playout duration, not concatenate alternating sources.",
+    "timing": "Probe wire-advertised sender timingPort through emulator OS UDP redirection; validate RTP timing response origin echo, nonzero ordered receive/transmit clocks and advancing remote clock",
+    "continuity": "Decoded audio/video maximum1s gap; moving video must sustain at least15fps for the independent20fps source, excluding1fps placeholder/freeze regressions. Audio decoded sample duration must cover elapsed playout within0.35s startup/tail underfill allowance and0.5s overfill allowance, not merely packet arrivals. UDP keepalive maximum7s, feedback/screen keepalive maximum3s; healthy late/duplicate invites preserve control epoch."
+  },
+  "source": {
+    "tcp_ports": [7240, 8240, 9240, 9241, 9242, 9340, 9440],
+    "framing": "Command/touch: u16BE length,u16BE reserved,u32BE type. Other: u32BE length,u32BE sequence-or-ms,u32BE type.",
+    "video": "2560x800 20fps libx264 AnnexB scheduled on monotonic timeline; independent generated red/green state plus moving blue stripe, repeated SPS/PPS/IDR every second. Receiver display remains observed2662x812; no low-resolution full-gate fallback.",
+    "music": "44100Hz stereo s16LE sine440Hz; touch -> INIT, STOP0x30002, INIT, PCM0x30006 then command-channel module3=1. No RESUME inferred or synthesized.",
+    "navigation": "16000Hz mono s16LE sine880Hz on separate TTS TCP, INIT0x40001/data0x40003/STOP0x40002",
+    "intent": "Only generated source wire changes, not test-only app state. Idle starts module3=0. Touch is delivered by encrypted receiver HID event and received back on source touch TCP before new green video/music."
+  },
+  "scenarios": {
+    "baseline": "Encrypted control/event, iAP completion, car radio preserved at idle, HID->source->decoded green and music, then60s continuous decoded media motion/audio and watchdogs, exceeding the observed10–20s vehicle failures",
+    "late-invite": "After decoded audio/video, production ctrl invitation; same authenticated control epoch and uninterrupted media",
+    "duplicate-invite": "Two production ctrl invitations on healthy session; no transport retirement",
+    "screen-yield-return": "Car takes screen, screen output stops while music continues; actual requestUI returns decoded screen",
+    "radio-yield-return": "Car takes audio; repeated INIT/PCM/focus1 and source audio socket reconnect do not steal radio; whole AirPlay helper rebuild plus concurrent source reconnect must retain the same suppression; only focus0 plus genuine fresh play restores decoded music",
+    "navigation": "Stop music, car radio owns audio; TTS starts temporary borrow, decoded880Hz; TTS stop returns permanent car ownership and stops output",
+    "peer-reset": "Close complete peer control/event/media transports and concurrently reset actual CarLife source TCP sockets while preserving ongoing focus1; socket initialization repeats INIT/STOP/INIT+PCM but no focus0/new-focus1 episode, HID touch or RESUME is introduced; normal reconnect must perform fresh pairing and resume decoded green video/music",
+    "teardown-reconnect": "Normal app disconnect must TEARDOWN all active streams and session, then normal reconnect resumes decoded media under fresh pairing",
+    "network-drop-reconnect": "OS emulator WiFi disable/enable combined with whole peer TCP reset then normal reconnect; fresh keys and decoded media required",
+    "source-reconnect": "Three successive resets of all actual CarLife source TCP sockets during one playing focus episode. Each new source carries a different visible generation marker and PCM changes to660/550/770Hz without a playback/focus edge. Require both independently decoded markers within8s under the same AirPlay control epoch, then measure steady media continuity/fps on every cycle. Buffered pre-reset media cannot satisfy recovery.",
+    "stale-audio-take": "Hold actual modesChanged audio-take acceptance, deliver actual CarLife STOP/module3=0 while held, then release delayed200. Receiver must observe explicit car-ownership rollback and no decoded audio activation.",
+    "car-take-during-claim": "Controlled protocol-admissible initial phone audio ownership/take100, with observed ID8 screen/media capabilities. Hold first actual source-authorized media500 modesChanged acceptance; send HU audio TAKE500 via separate encrypted event socket, then release old200. Newer car TAKE remains authoritative despite stale acceptance; continuing INIT/PCM/focus1 must not reacquire or activate decoded audio. Genuine STOP/module0 then fresh play must recover.",
+    "concurrent-audio": "44100Hz stereo440Hz music and independent16000Hz mono880Hz TTS at the same time. At least94% of100ms decoded windows must contain both tones audibly, below clipping; decoded duration must cover wall time within0.3s. Three rapid TTS STOP/INIT bursts preserve uninterrupted music, then music remains after TTS ends.",
+    "track-transition": "Three track boundaries STOP->INIT->PCM or STOP->PCM with retained format and unchanged music focus. Independently decode new660/550/770Hz tones within5s, including navigation across boundaries, then5s continuous correctly clocked audio per track under the same control epoch.",
+    "iap-window": "Observed receiver window5 and zero retry/cumulative-ACK timers; delay post-auth acknowledgements150ms and count unacknowledged payloads at network ingress. More than5 is failure. Require authenticated app-discovery response; local RTSP200 does not count as peer link acknowledgement.",
+    "source-start-order": "Reset the initial source video TCP socket and delay feature acknowledgement2s. Source acknowledges encoder geometry but starts producing H264 only after a fresh post-feature encoder initialization. Require real2560x800 video within8s, without recreating AirPlay or local pairing.",
+    "audio-record-delay": "Hold the new audio stream's RECORD response1s after video already activated. Every decrypted RTP packet must follow the individual audio stream's accepted RECORD; subsequent independently decoded media must remain continuous.",
+    "explicit-source-intent": "Continue source PCM after explicit PAUSE/focus release while navigation remains audible; decoded music must be absent. Accepted car TAKE followed by same-focus STOP/INIT/PCM must not reclaim radio; explicit RESUME must restore independently decoded660Hz without a new focus edge.",
+    "initial-source-cancel": "Prestart actual source PCM/focus before app launch, with a controlled phone-owned initial grant. Hold first audio SETUP200, send real CarLife PAUSE while residual PCM continues, release response; require that stream's TEARDOWN and no RECORD/RTP activation. Explicit RESUME must recover decoded440Hz in the same control epoch.",
+    "negative-bad-auth": "Corrupt only the SRP server proof; do not force a later pair-verify rejection. Any subsequent pair-verify or SETUP is bad-auth-continued; a client ignoring the proof and authenticating also fails. Missing authenticated control counts as expected rejection only after corruption was delivered. Following scenarios retain app data and must authenticate normally, catching persistent downgrade poisoning.",
+    "negative-iap-auth": "Withhold actual iAP challenge response and observe16s after the first challenge, covering6+3+3s supported retry windows with4s margin. AA05 without response, including late false success, is a hard protocol failure, never a successful negative result.",
+    "negative-no-audio": "At receiver network ingress discard authenticated audio payload before decoding; expected oracle rejection is missing decoded audio",
+    "negative-no-video": "At receiver network ingress discard authenticated video payload before decoding; expected oracle rejection is missing decoded video"
+  },
+  "artifacts": ["inputs.json", "receiver-input-*.plist", "rerun command (runner)", "network.jsonl", "source.h264", "source-*.s16le", "received-*.h264", "received-*.wav", "decoded-audio-quality.json", "frame-*.ppm", "outcome.json", "cleanup.json"],
+  "limits": [
+    "The car-take-during-claim and initial-source-cancel phone/take100 states are controlled protocol-admissible race setups, not asserted to be captured BMW session snapshots; actual per-session receiver-input plist records them.",
+    "Physical Bluetooth, real WiFi radio association and BMW UI/radio firmware are deliberately not bundled or validated.",
+    "ADB-reversed CarLife source is loopback; WiFi toggles alone do not interrupt it. Network-drop scenario explicitly also closes whole peer TCP transports.",
+    "Synthetic iAP certificate/signature tests order/completion and nonempty challenge response, not an Apple MFi trust chain. The app currently does not cryptographically verify the MFi signature.",
+    "Fixture combines observed AP11 capability geometry/audio with separately observed AP1 priority500 radio constraints; not claimed as an exact single captured snapshot.",
+    "The direct-sink driver bypasses Bluetooth/mDNS activation policy. Single-use identity/network-scoped invite consumption is verified separately at its pure policy interface, not claimed as complete network-discovery E2E coverage.",
+    "Per-vehicle rendering latency, speaker acoustics and radio hardware output require vehicle evidence; decoded host media is the network end-effect oracle."
+  ]
+}

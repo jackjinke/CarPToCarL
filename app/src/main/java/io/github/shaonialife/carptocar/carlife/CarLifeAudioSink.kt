@@ -1,6 +1,7 @@
 package io.github.shaonialife.carptocar.carlife
 
 import io.github.shaonialife.carptocar.audio.AudioSender
+import io.github.shaonialife.carptocar.audio.PcmSource
 
 /**
  * CarLife 音频桥接（手机 → 车机方向的**直通落地点**）。
@@ -26,6 +27,7 @@ internal class CarLifeAudioSink(
      * （2026-10-27 日志：10:35:04 刚触发暂停丢弃，10:35:14 的导航 TTS 就来了）。
      */
     private val dropWhenPaused: Boolean = true,
+    private val source: PcmSource = PcmSource.MEDIA,
 ) {
     /** CarLife 引擎宣告的源采样率（CarlifeMusicInit；<=0 表示尚未宣告，按 48k 处理）。 */
     @Volatile
@@ -84,6 +86,7 @@ internal class CarLifeAudioSink(
      */
     fun setPlaybackPaused(paused: Boolean) {
         val changed = playbackPaused != paused
+        if (changed && paused && dropWhenPaused) clearPendingPcm()
         playbackPaused = paused
         if (!paused) {
             pausedSince = 0L
@@ -123,6 +126,7 @@ internal class CarLifeAudioSink(
         sampleRate: Int,
         channels: Int,
     ) {
+        if (srcRate > 0 && (srcRate != sampleRate || srcChannels != channels)) clearPendingPcm()
         srcRate = sampleRate.coerceIn(MIN_RATE, MAX_RATE)
         srcChannels = if (channels == 1) 1 else 2
         log("CARLIFE: 音频格式 ${srcRate}Hz ${if (srcChannels == 2) "立体声" else "单声道"} 16bit（直通）")
@@ -135,8 +139,19 @@ internal class CarLifeAudioSink(
         channels: Int,
         pcm: ByteArray,
         size: Int,
+        forwardingAllowed: Boolean,
     ) {
         if (size <= 0) return
+        require(size <= pcm.size)
+        // Observe the producer even while receiver ownership/setup prevents forwarding.
+        sampleLevel(pcm, size)
+        packets++
+        bytes += size
+        reportIfDue()
+        if (!forwardingAllowed) {
+            countDroppedWhenPaused()
+            return
+        }
         // 音乐会话暂停后的一小段窗口内：丢弃引擎仍在推的残留 PCM（避免重复播放）
         val now = android.os.SystemClock.uptimeMillis()
         if (dropWhenPaused && shouldDropPaused(now)) {
@@ -152,11 +167,7 @@ internal class CarLifeAudioSink(
         val sender = io.github.shaonialife.carptocar.SessionController.audioSender
         if (sender == null || !sender.isRunning) return
         // 直通：交给 AudioSender 重采样 + 封包 + 发送
-        sender.feedPcm(pcm, size, srcRate, srcChannels)
-        sampleLevel(pcm, size)
-        packets++
-        bytes += size
-        reportIfDue()
+        sender.feedPcm(pcm, size, srcRate, srcChannels, source)
     }
 
     /** 抽样统计电平（每 16 个采样点取 1 个，开销可忽略）。 */
@@ -175,8 +186,14 @@ internal class CarLifeAudioSink(
         }
     }
 
+    /** STOP/pause affects this source queue, never the receiver stream or the other source. */
+    fun clearPendingPcm() {
+        io.github.shaonialife.carptocar.SessionController.audioSender?.clearPcm(source)
+    }
+
     @Synchronized
     fun stop() {
+        clearPendingPcm()
         srcRate = 0
         srcChannels = 2
         packets = 0
@@ -191,14 +208,7 @@ internal class CarLifeAudioSink(
         sampledSinceReport = 0
     }
 
-    /**
-     * 「暂停中丢弃」的诊断计数。
-     *
-     * 触发条件只看媒体会话状态（`nowPlaying.playing == false`），而导航播报、系统提示音
-     * 很多时候**不产生** PLAYING 会话——一旦被误判成暂停，音频就会被静默丢掉，
-     * 表现为「刚连上开导航没声音，开始放音乐才有声」。这里每 5 秒记一条，
-     * 下次导出日志就能直接确认是不是这条路径吃掉了声音。
-     */
+    /** Aggregate source/session playback-gate drops; no navigation gate or per-packet logs. */
     private fun countDroppedWhenPaused() {
         droppedWhenPaused++
         val now = android.os.SystemClock.uptimeMillis()
@@ -207,7 +217,7 @@ internal class CarLifeAudioSink(
             return
         }
         if (now - lastDropReportAt < DROP_REPORT_INTERVAL_MS) return
-        log("CARLIFE: 暂停期间丢弃 ${droppedWhenPaused} 包 PCM（若此时本应有导航/媒体声音，说明会话状态被误判）")
+        log("CARLIFE: 播放门控 source=$source 丢弃 ${droppedWhenPaused} 包 PCM（源暂停/失焦或已知媒体会话暂停；导航独立）")
         droppedWhenPaused = 0
         lastDropReportAt = now
     }
@@ -224,7 +234,9 @@ internal class CarLifeAudioSink(
         val peakPercent = peakSinceReport * 100 / 32768
         val nonZeroPercent = if (sampledSinceReport > 0) (nonZeroSinceReport * 100 / sampledSinceReport).toInt() else 0
         log(
-            "CARLIFE: 音频直通 ${packets} 包 / ${bytes / 1024}KB / ${kbps}kbps" +
+            "CARLIFE: 音频源 source=$source ${packets} 包 / ${bytes / 1024}KB / ${kbps}kbps " +
+                "inputBps=${(bytes / seconds).toLong()} ${srcRate}Hz ${srcChannels}ch " +
+                "senderRunning=${io.github.shaonialife.carptocar.SessionController.audioSender?.isRunning == true}" +
                 " · 电平 ${peakPercent}%（非零 ${nonZeroPercent}%）",
         )
         lastReportAt = now
@@ -261,11 +273,12 @@ internal class CarLifeAudioSink(
 internal fun carLifeAudioTypeName(type: Int): String =
     when (type) {
         CarLifeProtocol.MUSIC_PKG_INIT -> "INIT"
-        CarLifeProtocol.MUSIC_PKG_START -> "开始"
         CarLifeProtocol.MUSIC_PKG_STOP -> "停止"
+        CarLifeProtocol.MUSIC_PKG_PAUSE -> "暂停"
+        CarLifeProtocol.MUSIC_PKG_RESUME -> "恢复播放"
         CarLifeProtocol.MUSIC_PKG_NORMAL -> "PCM"
         CarLifeProtocol.TTS_PKG_INIT -> "TTS-INIT"
-        0x40002 -> "TTS-开始"
+        CarLifeProtocol.TTS_PKG_STOP -> "TTS-停止"
         0x40003 -> "TTS-PCM"
         else -> "0x%X".format(type)
     }

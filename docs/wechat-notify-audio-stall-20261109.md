@@ -21,8 +21,9 @@
 
 两条叠在一起：
 
-1. **CarLife 引擎自己停媒体通道**。手机侧 CarLife+ 要为提示音切换音频路由，于是发
-   `0x30003` 停掉媒体 PCM，311ms 后再 `0x30002` 恢复。这是引擎行为，我们改不了。
+1. **CarLife 引擎暂停媒体通道，随后重建音频流**。历史日志把 `0x30002` 标成了“开始”，
+   2026-11-12 核对手机 APK 后确认它其实是 STOP；`0x30003` 是 PAUSE，`0x30004` 才是 RESUME。
+   上面的 311ms 间隔由 PCM 与格式重建时间确定，不能从 STOP 编号推出恢复播放。
 2. **我们在这 311ms 里一个包都不发**。`AudioSender` 的静音保活阈值是 300ms
    （`IDLE_FILL_AFTER_MILLIS`），而中断只有 311ms —— 几乎没补上帧。车机的 jitter buffer
    被排空，恢复瞬间要重新缓冲，听感就是「卡一下」，而不是「静音 0.3 秒」。
@@ -35,8 +36,8 @@
 
 | 改动 | 位置 |
 | --- | --- |
-| 引擎报 `0x30003` 时**立即**补静音（阈值 300ms → 0） | `AudioSender.beginIdleFill()` |
-| 引擎报 `0x30002` 时恢复阈值 | `AudioSender.endIdleFill()` |
+| 引擎报 STOP `0x30002` / PAUSE `0x30003` 时立即补静音（阈值 300ms → 0） | `AudioSender.beginIdleFill()` |
+| 明确 RESUME 或当前源的格式 INIT 重建时恢复阈值；INIT 不触发取权 | `AudioSender.endIdleFill()` |
 | 只有停 ≥ 2s 才补发同步包重对齐（短中断靠静音帧续时间戳，不重对齐） | `CarLifeHijack.onEngineAudioGate()` |
 | 单拍补帧上限 12 → 16（100ms 一拍需要 13.6 帧，12 会让补帧永远慢一拍） | `MAX_KEEPALIVE_FRAMES_PER_TICK` |
 

@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "sources": [
+    {
+      "capture": "docs/bmw-fork-port-20261108.md section3b, independently collected BMW sessions",
+      "lines": "63-85",
+      "retained": "First RECORD accepted while virtual iAP control negotiation is still incomplete; iAP becomes ready1.4-1.9s later. RECORD and iAP readiness must not be coupled into an invented rejection gate."
+    },
+    {
+      "capture": "session8 BMW MGU-93 firmware 23.50.3",
+      "fixture": "replay-inputs/ap11-info.plist",
+      "sha256": "ed33eeb683d8cdaa26611bd339b95cd344d0f457c2423c3a99a7ead1aa96a573",
+      "retained": "audio formats/latencies, display geometry, HID descriptors, feature flags, appState and resource constraints only"
+    },
+    {
+      "capture": "session8 findings.json audio_resource_fixtures.1",
+      "retained": "takeConstraint500/transferPriority500; radio priority policy composed with AP11 media/display capabilities"
+    },
+    {
+      "capture": "working-box hct_xiap2_20261013_090326.log",
+      "lines": "704-855,197-199",
+      "retained": "DETECT echo, HU SYN, AA06 advertised serial selector -> bare certificate request -> challenge response -> AA05",
+      "uncertainty": "WLAN first20byte AA00 tail is not printed; empty parameter0 corroborated Bluetooth sibling, not directly observed WLAN bytes."
+    },
+    {
+      "capture": "working-box hct_xiap2_20261013_090326.log",
+      "lines": "708-727,908-911",
+      "retained": "Reliable WLAN SYN has peerWindow5/localWindow32, zero retransmissions and cumulative-ACK timers; AD00->AD01 with five-byte response body.",
+      "reference": "https://github.com/fw867/hypercar/blob/694a2dcea66866def2166e8261dec0ddb1153186/app/src/main/java/io/github/hypercar/iap2/WifiIap2Protocol.kt#L198-L199",
+      "uncertainty": "Exact AD01 parameter0 value1 is attributed to reference firmware analysis, not printed in the working-box log tail. Delayed150ms ACK schedule is a controlled flow-control stimulus, not a captured timing trace."
+    },
+    {
+      "capture": "session9 three 2026-11-13 vehicle exports",
+      "retained": "Music and navigation concurrent stutter, post-track silence reported; CarLife INIT/STOP/INIT and same-focus playback, repeated TTS STOP/INIT. Initial video socket reset followed encoder-init before feature ACK; successful later startup has feature ACK before encoder-init and actual first source IDR.",
+      "uncertainty": "Exports omit media payloads. Tones and strict prerequisite-sensitive source are independently generated controlled stimuli to expose clock/lifecycle/order defects; they are not raw vehicle waveform or OEM source code."
+    }
+  ],
+  "anonymization": "All display UUIDs replaced; no MAC, SSID, pairing ID/key, Bluetooth IDs, serials, OEM icon data or private exports. Session identities and certificates generated afresh.",
+  "known_limits": [
+    "Network roles only: physical Bluetooth, Wi-Fi association, BMW UI/firmware and radio hardware not tested.",
+    "Synthetic self-signed iAP certificate has no Apple MFi trust chain; validates wire completion/order, not MFi trust certification.",
+    "Resource priority scenario is composed from separately observed AP1/AP11 capabilities, not claimed as one exact vehicle snapshot.",
+    "Media fixtures generated independently at2560x800/20fps using libx264 and sinusoidal PCM; oracle decodes output and checks source-visible geometry independently of2662x812 HU canvas, colors, movement, tones, timed gaps and actual decoded sample duration."
+  ]
+}

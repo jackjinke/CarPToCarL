@@ -58,6 +58,7 @@ import io.github.shaonialife.carptocar.util.AppVersion
 import io.github.shaonialife.carptocar.util.Bg
 import io.github.shaonialife.carptocar.util.DeviceIdentity
 import io.github.shaonialife.carptocar.util.LogExporter
+import io.github.shaonialife.carptocar.util.SessionTrace
 import io.github.shaonialife.carptocar.util.SysShell
 import io.github.shaonialife.carptocar.video.StreamFps
 import java.util.Locale
@@ -1240,6 +1241,18 @@ class MainActivity : AppCompatActivity() {
 
         // ---- 折叠卡：日志 ----
         bindExpandable(R.id.logHeader, logBody, logChevron)
+        findViewById<View>(R.id.btnScreenExited).setOnClickListener {
+            // Captures the tap under the trace lock; SessionTrace owns background disk writes.
+            // No transport state is inferred from a successful send or a missing disconnect.
+            SessionTrace.markObservation("车机画面已退出")
+            val time = java.text.SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(java.util.Date())
+            findViewById<TextView>(R.id.screenExitObservationStatus).apply {
+                text = "已标记 $time · 快照后台保存，可导出日志"
+                visibility = View.VISIBLE
+            }
+            log("用户观察 $time：车机画面已退出（不代表网络已断开）")
+            snack("已标记画面退出；请导出日志保留现场", 4_000L)
+        }
 
         // 启动残留虚拟屏检测（页面已不再展示 Shell 状态，仅保留自动清理与英雄卡状态联动）
         detectResidualDisplays()
@@ -1268,12 +1281,12 @@ class MainActivity : AppCompatActivity() {
             }
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.setPrimaryClip(ClipData.newPlainText("CarPToCarL 日志", text))
-            snack("已复制 ${text.length} 字符日志")
+            snack("已复制 ${text.length} 字符运行日志；完整敏感诊断请点导出", 4_000L)
         }
         findViewById<ImageView>(R.id.btnExportLog).setOnClickListener { exportLogFile() }
-        // 长按导全部历史：默认只导本次启动，历史日志量大时按需手动取
+        // 默认携带跨重启的保留证据；长按仅导本次进程，方便缩小范围。
         findViewById<ImageView>(R.id.btnExportLog).setOnLongClickListener {
-            exportLogFile(LogExporter.Scope.ALL)
+            exportLogFile(LogExporter.Scope.CURRENT_SESSION)
             true
         }
 
@@ -1789,7 +1802,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateAudioTag() {
         if (heroState != HeroState.CONNECTED) return
-        // 2026-10-24 起默认带声音（无开关），只看音频通道是否真的在推流
+        // Sender activity is observable; audibility at the car's speakers is not.
         val on = SessionController.audioSender?.isRunning == true
         val icon =
             ContextCompat.getDrawable(
@@ -1798,7 +1811,7 @@ class MainActivity : AppCompatActivity() {
             )!!
         DrawableCompat.setTint(icon.mutate(), getColor(if (on) R.color.m3_ok else R.color.m3_outline))
         audioTag.setCompoundDrawablesWithIntrinsicBounds(icon, null, null, null)
-        audioTag.text = if (on) "车机侧声音 · 开启" else "车机侧声音 · 关闭"
+        audioTag.text = "音频 · ${SessionController.audioStatus}"
     }
 
     /**
@@ -2407,8 +2420,8 @@ class MainActivity : AppCompatActivity() {
     /**
      * 导出日志到「下载/CarPToCarL/」并弹窗告知位置。
      */
-    private fun exportLogFile(scope: LogExporter.Scope = LogExporter.Scope.CURRENT_SESSION) {
-        snack(if (scope == LogExporter.Scope.ALL) "正在导出全部日志…" else "正在导出本次启动的日志…")
+    private fun exportLogFile(scope: LogExporter.Scope = LogExporter.Scope.ALL) {
+        snack(if (scope == LogExporter.Scope.ALL) "正在导出近期完整诊断…" else "正在导出本次启动的日志…")
         val fallback = SessionController.logText()
         Bg.run("export-log") {
             val result = LogExporter.export(applicationContext, fallback, scope)
@@ -2421,9 +2434,9 @@ class MainActivity : AppCompatActivity() {
                 log("日志已导出（${scope.label}）: ${result.displayPath}（${result.bytes} 字节）")
                 val scopeNote =
                     if (scope == LogExporter.Scope.CURRENT_SESSION) {
-                        "仅含本次 App 启动之后的日志。需要更早的历史，请长按导出按钮。"
+                        "包含本次 App 启动的运行日志、可用 RTSP 和会话快照。点按导出可携带重启前的保留证据。"
                     } else {
-                        "包含历史日志（文件上限 2MB，超出时只保留最近一段）。"
+                        "包含容量限制内的跨进程历史，保留重启前的失败；历史版本以各进程启动记录为准。"
                     }
                 DarkMessageDialog.show(
                     this,
@@ -2431,6 +2444,7 @@ class MainActivity : AppCompatActivity() {
                     message =
                         "文件位置：\n${result.displayPath}\n\n" +
                             "大小：${formatBytes(result.bytes)}\n$scopeNote\n\n" +
+                            "含设备与网络等敏感协议原文，仅与信任的人分享。\n\n" +
                             "可在「文件管理 → 下载 → CarPToCarL」中找到，也可直接分享给开发者排查问题。",
                     actions =
                         listOf(

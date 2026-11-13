@@ -6,6 +6,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import io.github.shaonialife.carptocar.SessionController
+import io.github.shaonialife.carptocar.video.VideoCanvasMode
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -19,17 +21,17 @@ import java.util.Locale
  *  - MediaStore.Downloads 无需任何存储权限，落盘即出现在系统「下载」目录，
  *    微信/QQ/邮件发送附件也能直接选到。
  *
- * 内容优先取 `files/main_debug.log`：它记录全部 appendLog（不受 UI 日志开关影响，
- * 最多保留最近 2MB）；文件不可读时才退回 UI 的内存缓冲（最近 20~40KB）。
+ * 运行日志、完整可用的控制/event RTSP、当前与近期会话证据写入同一文件。
+ * 默认携带容量限制内的跨进程历史，保留重启前失败；长按导出可仅取本次进程。
  */
 object LogExporter {
-    /** 导出范围：默认只导本次进程启动后的日志（历史轮次对排查是噪音）。 */
+    /** 默认保留重启前的失败证据，各日志存储仍按原容量轮转。 */
     enum class Scope(
         val label: String,
         val fileNameTag: String,
     ) {
         CURRENT_SESSION("仅本次启动", ""),
-        ALL("全部历史日志", "-all"),
+        ALL("近期保留日志（跨进程）", "-all"),
     }
 
     data class Result(
@@ -51,9 +53,10 @@ object LogExporter {
     fun export(
         context: Context,
         fallbackText: String,
-        scope: Scope = Scope.CURRENT_SESSION,
+        scope: Scope = Scope.ALL,
     ): Result? {
-        val body = buildContent(context, fallbackText, scope)
+        // This method is called on Bg; stream bounded retained evidence rather than duplicating
+        // tens of megabytes into one String and then another UTF-8 byte array.
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val fileName = "CarPToCarL-log-$stamp${scope.fileNameTag}.txt"
         val resolver = context.contentResolver
@@ -68,11 +71,22 @@ object LogExporter {
             }
         val uri = resolver.insert(collection, values) ?: return null
         return try {
-            val bytes = body.toByteArray(Charsets.UTF_8)
-            resolver.openOutputStream(uri)?.use { it.write(bytes) }
-                ?: throw IllegalStateException("openOutputStream 返回 null")
+            var byteCount = 0L
+            val stream = resolver.openOutputStream(uri) ?: throw IllegalStateException("openOutputStream 返回 null")
+            val counted = object : java.io.FilterOutputStream(stream) {
+                override fun write(value: Int) {
+                    out.write(value)
+                    byteCount++
+                }
+
+                override fun write(buffer: ByteArray, offset: Int, length: Int) {
+                    out.write(buffer, offset, length)
+                    byteCount += length
+                }
+            }
+            counted.bufferedWriter(Charsets.UTF_8).use { writeContent(it, context, fallbackText, scope) }
             resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
-            Result(uri, fileName, "$DISPLAY_ROOT/$RELATIVE_DIR/$fileName", bytes.size.toLong(), scope)
+            Result(uri, fileName, "$DISPLAY_ROOT/$RELATIVE_DIR/$fileName", byteCount, scope)
         } catch (_: Exception) {
             // 半截文件（IS_PENDING=1）对用户不可见，但会占空间——清掉
             runCatching { resolver.delete(uri, null, null) }
@@ -80,51 +94,71 @@ object LogExporter {
         }
     }
 
-    private fun buildContent(
+    internal fun writeContent(
+        out: Appendable,
         context: Context,
         fallbackText: String,
         scope: Scope,
-    ): String =
-        buildString {
+    ) {
+        with(out) {
             appendLine("CarPToCarL 运行日志")
             appendLine("导出时间: " + SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()))
             appendLine("应用版本: " + AppVersion.nameWithTag(context))
+            appendLine("版本说明: 上述为当前安装版本；历史记录以各进程启动版本为准。")
+            val install = runCatching {
+                @Suppress("DEPRECATION")
+                val info = context.packageManager.getPackageInfo(context.packageName, 0)
+                "versionCode=${info.longVersionCode} lastUpdateTime=${info.lastUpdateTime}"
+            }.getOrElse { "unavailable(${it.javaClass.simpleName}: ${it.message})" }
+            appendLine("安装信息: $install")
+            appendLine("诊断能力: deferred-invite; requestUI-resume; independent-screen-audio; transport-health")
+            appendLine("导出时会话快照（非失败时快照）: ${SessionController.diagnosticSnapshot()}")
+            val network = runCatching {
+                val manager = context.getSystemService(android.net.ConnectivityManager::class.java)
+                if (manager == null) "service-unavailable" else {
+                    val active = manager.activeNetwork
+                    "uid=${android.os.Process.myUid()} active=$active bound=${manager.boundNetworkForProcess} " +
+                        "activeCaps=${active?.let(manager::getNetworkCapabilities)}"
+                }
+            }.getOrElse { "unavailable(${it.javaClass.simpleName}: ${it.message})" }
+            appendLine("导出时应用可见网络（非全局 VPN 状态）: $network")
             appendLine("导出范围: " + scope.label)
             appendLine(
                 "设备: ${Build.MANUFACTURER} ${Build.MODEL} | " +
                     "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
             )
+            appendLine("敏感诊断：包含现有协议原文（设备标识、网络信息等），请仅与信任的人分享。")
+            appendLine("RTSP capture enabled=${RtspDump.enabled}; media packets excluded")
+            val settings = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+            // Allowlist only: never dump pairing identities, keys, SSIDs or arbitrary preferences.
+            val configKeys = listOf(
+                "logEnabled", "bt_identity_probe", "carlife_hijack_enabled",
+                "carlife_fps", "carlife_connect_type", "carlife_ordered_init", "carlife_settle_reinit",
+            )
+            val configured = settings.all
+            appendLine("配置（未设置=应用默认；不读取或修改偏好）:")
+            for (key in configKeys) appendLine("  $key=${configured[key] ?: "未设置"}")
+            appendLine("当前视频声明: ${VideoCanvasMode.mode} (${VideoCanvasMode.describe()})")
+            appendLine("视频停摆策略: 仅观测（上游 1.2.34），不自动干预")
             appendLine("==================================================")
-            val fileLog = DebugFileLog.read(context, currentSessionOnly = scope == Scope.CURRENT_SESSION)
-            if (!fileLog.isNullOrBlank()) {
-                if (scope == Scope.CURRENT_SESSION) {
-                    appendLine("（仅本次进程启动之后的日志；需要历史请点「导出全部」）")
-                } else {
-                    appendLine("（全部文件日志；文件最多 2MB，超出时系统只保留最近一段）")
-                }
-                append(fileLog)
-                if (!fileLog.endsWith('\n')) appendLine()
+            if (scope == Scope.CURRENT_SESSION) {
+                appendLine("（仅本次进程启动之后的日志；需要历史请点按导出）")
             } else {
-                // 启动标记刚写、其余日志还没落盘（或文件不可读）时，界面缓冲仍是有效来源
+                appendLine("（近期文件日志；最多 8 段 × 2 MiB = 16 MiB，按时间顺序保留跨进程历史）")
+            }
+            if (!DebugFileLog.appendAvailable(this, context.filesDir, currentSessionOnly = scope == Scope.CURRENT_SESSION)) {
+                // A startup marker alone is not useful evidence; retain the UI fallback.
                 appendLine("（文件日志不可用——导出界面缓冲，可能不完整）")
                 append(fallbackText)
             }
-            // 连接失败报文快照：只在「未建链就跑完一轮」时由 SessionTrace 落盘，
-            // 正常连接的轮次不产生文件（也不占空间）。附在这里，一份日志就能还原现场：
-            // 过程日志说我们放弃了什么，报文说车机最后发了什么。
-            val failure = SessionTrace.latestFailure(context)
-            val trace = failure?.let { SessionTrace.readFile(it) }
-            if (!trace.isNullOrBlank()) {
-                appendLine()
-                appendLine("============ 连接失败报文快照（${failure.name}）============")
-                appendLine("格式：[时刻] 方向 通道 类型 id 长度 报文体hex；TX=手机→车机，RX=车机→手机")
-                appendLine("（仅未建链的轮次才会生成；视频/音频帧不记录）")
-                appendLine("================================================================")
-                append(trace)
-                if (!trace.endsWith('\n')) appendLine()
-            } else {
-                appendLine()
-                appendLine("（本轮没有连接失败报文快照——没发生未建链的会话，或快照已被清理）")
-            }
+            appendLine()
+            appendLine("============ 完整可用 RTSP（control / event）============")
+            appendLine("范围: ${scope.label}；每条含时间、方向、通道、完整头部和 payload hex。")
+            RtspDump.appendAvailable(this, context.filesDir, currentProcessOnly = scope == Scope.CURRENT_SESSION)
+            appendLine()
+            appendLine("============ 当前 / 近期会话与用户观察 ============")
+            appendLine("范围: ${scope.label}；建链成功不再丢弃，导出不依赖断链回调。")
+            SessionTrace.appendAvailable(this, context, currentProcessOnly = scope == Scope.CURRENT_SESSION)
         }
+    }
 }

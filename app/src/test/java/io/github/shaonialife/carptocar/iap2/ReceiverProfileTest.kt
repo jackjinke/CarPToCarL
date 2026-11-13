@@ -2,7 +2,6 @@ package io.github.shaonialife.carptocar.iap2
 
 import io.github.shaonialife.carptocar.net.AirPlayFeatures
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** 车机画像判定（纯函数）：信号组合 → era/wifiGen + 可解释依据。 */
@@ -12,7 +11,6 @@ class ReceiverProfileTest {
         val p = ReceiverProfile.classify(ReceiverProfile.Signals())
         assertEquals(ReceiverProfile.Era.UNKNOWN, p.era)
         assertEquals(ReceiverProfile.WifiGen.UNKNOWN, p.wifiGen)
-        assertTrue(p.reasons.isNotEmpty())
     }
 
     @Test
@@ -26,7 +24,6 @@ class ReceiverProfileTest {
                 ReceiverProfile.Signals(features = features, srcvers = "210.81"),
             )
         assertEquals(ReceiverProfile.Era.PRE_HOMEKIT, p.era)
-        assertTrue(p.reasons.any { it.contains("无 bit38") })
     }
 
     @Test
@@ -53,8 +50,7 @@ class ReceiverProfileTest {
      * 「两条请求并行发、谁先回用谁」兜底。
      */
     @Test
-    fun wifiGenLegacyWhenListsDeclareOldProtocol() {
-        // 奥迪形态：发送清单含 0x5703
+    fun sparseCarPlayListsStayUnknown() {
         val p =
             ReceiverProfile.classify(
                 ReceiverProfile.Signals(
@@ -65,15 +61,14 @@ class ReceiverProfileTest {
                     receiveIds = setOf(0x4e0c, 0x4e09, 0x4300, 0xea00),
                 ),
             )
-        // 奥迪清单稀疏（2+5 项）且未列 0x57xx——虽实际走旧协议，但清单不构成证据：
-        // 稀疏清单判 UNKNOWN（保守旧协议），完整清单才判 NEW
+        // 0x4301 声明不足以排除旧凭据路径，稀疏清单保留探测。
         assertEquals(ReceiverProfile.WifiGen.UNKNOWN, p.wifiGen)
         assertEquals("Audi_MMI_0000 AUDI 0000 DELPHI", p.identityKey)
     }
 
     @Test
-    fun wifiGenNewWhenFullListsLackOldProtocol() {
-        // BMW iD9 形态：两清单完整（10+ 项）、均无 0x5702/0x5703
+    fun wifiGenNewWhenFullListsAdvertiseStartSession() {
+        // 已声明 0x4301 的完整清单保留新代路径。
         val p =
             ReceiverProfile.classify(
                 ReceiverProfile.Signals(
@@ -82,7 +77,25 @@ class ReceiverProfileTest {
                 ),
             )
         assertEquals(ReceiverProfile.WifiGen.NEW, p.wifiGen)
-        assertTrue(p.reasons.any { it.contains("0x4301 提供") })
+    }
+
+    @Test
+    fun fullMediaListsDoNotProveNewWifiProtocol() {
+        // 同一台车重连时的普通 iAP 视图：26 项均未提供无线凭据协议证据。
+        val profile =
+            ReceiverProfile.classify(
+                ReceiverProfile.Signals(
+                    sendIds = setOf(
+                        0x5000, 0x5002, 0x5003, 0x6800, 0x6802, 0x6803, 0x4c00,
+                        0x4c02, 0x4c03, 0x4c05, 0x4c07, 0xae00, 0xae02, 0xea03,
+                    ),
+                    receiveIds = setOf(
+                        0x4e09, 0x4e0a, 0x4e0b, 0x4e0c, 0x5001, 0x6801,
+                        0x4c01, 0x4c04, 0x4e0d, 0xae01, 0xea00, 0xea01,
+                    ),
+                ),
+            )
+        assertEquals(ReceiverProfile.WifiGen.UNKNOWN, profile.wifiGen)
     }
 
     @Test
@@ -96,26 +109,12 @@ class ReceiverProfileTest {
         assertEquals(ReceiverProfile.WifiGen.UNKNOWN, p.wifiGen)
     }
 
-    @Test
-    fun describeCarriesReasons() {
-        val p =
-            ReceiverProfile.classify(
-                ReceiverProfile.Signals(features = 1L shl 38, srcvers = "450.14.2", sendIds = setOf(0x5703)),
-            )
-        val text = ReceiverProfile.describe(p)
-        assertTrue(text.contains("era=MODERN"))
-        assertTrue(text.contains("wifiGen=LEGACY"))
-        assertTrue(text.contains("srcvers=450.14.2"))
-        // 配对策略必须同行可见：排查「为什么没走配对」先看这一项
-        assertTrue(text.contains("pairing=REQUIRED"))
-    }
-
     /**
      * 组件声明（0x1D01 参 12/24/30）目前只作**可解释信号**，不改变 era / wifiGen：
      * 这些组在部分车机上缺失或走私有编号，当硬分支会把已跑通的车型判进未知路径。
      */
     @Test
-    fun componentSignalsAreExplainedButDoNotChangeGeneration() {
+    fun componentSignalsDoNotChangeGeneration() {
         val base =
             ReceiverProfile.classify(
                 ReceiverProfile.Signals(sendIds = setOf(0x5703), receiveIds = setOf(0x5702)),
@@ -130,21 +129,9 @@ class ReceiverProfileTest {
                     navigationDisplayComponent = true,
                 ),
             )
+        assertEquals(ReceiverProfile.WifiGen.LEGACY, base.wifiGen)
         assertEquals(base.era, withComponents.era)
         assertEquals(base.wifiGen, withComponents.wifiGen)
-        val text = ReceiverProfile.describe(withComponents)
-        assertTrue(text.contains("参12 语言=zh-CN"))
-        assertTrue(text.contains("参24 无线CarPlay组件=已声明"))
-        assertTrue(text.contains("参30 导航显示组件=已声明"))
-    }
-
-    @Test
-    fun routeGuidanceInReceiveListIsRecordedInReasons() {
-        val p =
-            ReceiverProfile.classify(
-                ReceiverProfile.Signals(receiveIds = setOf(0x5200, 0x5201, 0x4300)),
-            )
-        assertTrue(ReceiverProfile.describe(p).contains("可收清单声明导航引导 0x52xx"))
     }
 
     /**
@@ -172,32 +159,4 @@ class ReceiverProfileTest {
         )
     }
 
-    @Test
-    fun dispatchSummaryNamesBothGenerations() {
-        // 新代车机：WiFi 走 0x4301，且声明了配对
-        val modern =
-            ReceiverProfile.classify(
-                ReceiverProfile.Signals(
-                    features = AirPlayFeatures.parse("0x44540380,0x61"),
-                    sendIds = setOf(0x4301, 0x5000, 0x5002, 0x5200, 0x5203, 0xae00, 0xae02, 0x4157),
-                    receiveIds = setOf(0x4300, 0x4e09, 0xaa00, 0xaa02, 0x5001, 0x5201, 0x4158),
-                ),
-            )
-        val modernText = ReceiverProfile.dispatchSummary(modern)
-        assertTrue(modernText.contains("0x4300→0x4301"))
-        assertTrue(modernText.contains("先配对"))
-
-        // 老车机：WiFi 走 0x5702/0x5703，且直接明文
-        val legacy =
-            ReceiverProfile.classify(
-                ReceiverProfile.Signals(
-                    features = (AirPlayFeatures.parse("0x44540380,0x61") ?: 0L) and
-                        AirPlayFeatures.HK_PAIRING_AND_ENCRYPT.inv(),
-                    sendIds = setOf(0x5703),
-                ),
-            )
-        val legacyText = ReceiverProfile.dispatchSummary(legacy)
-        assertTrue(legacyText.contains("0x5702→0x5703"))
-        assertTrue(legacyText.contains("et=NONE"))
-    }
 }

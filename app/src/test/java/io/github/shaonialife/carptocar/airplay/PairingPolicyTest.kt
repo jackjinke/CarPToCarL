@@ -1,9 +1,6 @@
 package io.github.shaonialife.carptocar.airplay
 
-import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -75,54 +72,4 @@ class PairingPolicyTest {
         assertFalse(error.deterministic)
     }
 
-    // ---- 短期记忆 ----
-
-    private val now = 1_700_000_000_000L
-
-    @Test
-    fun freshDeterministicRejectionSkipsSetup() {
-        val rejection = PairingRejection("pk-abc", PairingStage.PAIR_VERIFY, 2, now - 60_000)
-        assertEquals(PairingGate.SKIP_SETUP, PairingMemory.decide(rejection, "pk-abc", now))
-    }
-
-    @Test
-    fun memoryExpires() {
-        val rejection = PairingRejection("pk-abc", PairingStage.PAIR_VERIFY, 2, now - PairingMemory.TTL_MS)
-        assertEquals(PairingGate.NORMAL, PairingMemory.decide(rejection, "pk-abc", now))
-    }
-
-    @Test
-    fun memoryIsPerReceiver() {
-        val rejection = PairingRejection("pk-abc", PairingStage.PAIR_VERIFY, 2, now)
-        assertEquals(PairingGate.NORMAL, PairingMemory.decide(rejection, "pk-other", now))
-    }
-
-    @Test
-    fun transientCodeDoesNotCreateMemory() {
-        // 记的是 Error=3（退避）：那不是「别来了」，不该跳过下一轮配对
-        val rejection = PairingRejection("pk-abc", PairingStage.PAIR_SETUP, 3, now)
-        assertEquals(PairingGate.NORMAL, PairingMemory.decide(rejection, "pk-abc", now))
-    }
-
-    @Test
-    fun noRecordMeansNormal() {
-        assertEquals(PairingGate.NORMAL, PairingMemory.decide(null, "pk-abc", now))
-    }
-
-    @Test
-    fun rejectionRoundTripsThroughStorageFormat() {
-        val original = PairingRejection("pk-abc", PairingStage.PAIR_SETUP, 2, now)
-        assertEquals(original, PairingRejection.decode(original.encode()))
-        assertNull(PairingRejection.decode(null))
-        assertNull(PairingRejection.decode("garbage"))
-        assertNull(PairingRejection.decode("a|NOT_A_STAGE|2|123"))
-    }
-
-    @Test
-    fun receiverKeyPrefersPublicKeyThenDeviceIdThenSsid() {
-        assertEquals("pk", PairingMemory.receiverKey("pk", "dev", "ssid"))
-        assertEquals("dev", PairingMemory.receiverKey(null, "dev", "ssid"))
-        assertEquals("ssid", PairingMemory.receiverKey("", null, "ssid"))
-        assertNotNull(PairingMemory.receiverKey(null, null, "ssid"))
-    }
 }

@@ -43,6 +43,8 @@ android {
         targetSdk = 34
         versionCode = appVersionCode
         versionName = appVersionName
+        // The test APK only drives the real pipeline; the external peer owns network assertions.
+        testInstrumentationRunner = "io.github.shaonialife.carptocar.Id8NetworkInstrumentation"
     }
 
     signingConfigs {

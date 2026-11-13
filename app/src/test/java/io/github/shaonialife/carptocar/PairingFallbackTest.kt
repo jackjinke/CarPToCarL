@@ -58,7 +58,7 @@ class PairingFallbackTest {
     }
 
     @Test
-    fun `DiPlay 断链形态 - 无 403 - 保留二段 hack`() {
+    fun `DiPlay transport retry still requires authenticated keys`() {
         val f =
             pairingFallback(
                 false,
@@ -69,7 +69,7 @@ class PairingFallbackTest {
                 pairingUnsupported = false,
             )
         assertTrue(f.useBtRetireHack)
-        assertTrue(f.usePlainSession)
+        assertFalse(f.usePlainSession)
     }
 
     @Test
@@ -103,9 +103,8 @@ class PairingFallbackTest {
     }
 
     @Test
-    fun `车机确定性拒绝配对 - 禁断 BT - 保留明文兜底`() {
-        // 日志 221747：pair-setup / pair-verify 都回 {Error:2, State:4}。
-        // 断 BT 只会再失败一次（真车还会拆掉 BT 控制通道），但明文会话仍能给画面。
+    fun `authentication rejection preserves encryption requirement`() {
+        // A rejected identity is not evidence that the receiver supports legacy plaintext.
         val f =
             pairingFallback(
                 false,
@@ -117,7 +116,25 @@ class PairingFallbackTest {
                 pairingTerminal = true,
             )
         assertFalse("确定性拒绝与链路层状态无关，断 BT 无意义", f.useBtRetireHack)
-        assertTrue("画面不需要共享密钥，明文会话继续兜底", f.usePlainSession)
+        assertFalse("认证失败不能降级为缺少音频和触控的明文会话", f.usePlainSession)
+    }
+
+    @Test
+    fun `locally cancelled pairing never selects either fallback`() {
+        // Failure mode: a new start clears the shared cancellation flag while an old worker exits.
+        for (unsupported in listOf(false, true)) {
+            val fallback = pairingFallback(
+                keysEstablished = false,
+                noPairing = false,
+                pairSetupRejected = false,
+                pairingForbidden = false,
+                attemptedPairing = true,
+                pairingUnsupported = unsupported,
+                cancelled = true,
+            )
+            assertFalse(fallback.useBtRetireHack)
+            assertFalse(fallback.usePlainSession)
+        }
     }
 
     @Test

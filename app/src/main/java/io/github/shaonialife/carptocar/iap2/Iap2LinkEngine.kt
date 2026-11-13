@@ -35,6 +35,9 @@ class Iap2LinkEngine(
      * 10 次（30 秒）既留出抗抖动的余量，也不会把整轮 60 秒预算耗光。
      */
     private val maxRetransmissions: Int = 10,
+    /** Wi-Fi keeps ACK-based flow control even when retransmission is disabled by TCP. */
+    private val reliableTransport: Boolean = false,
+    private val declaredWindow: Int = PHONE_DECLARED_MAX_OUTGOING,
 ) {
     enum class State { IDLE, NEGOTIATING, NORMAL, DEAD }
 
@@ -239,6 +242,9 @@ class Iap2LinkEngine(
      */
     var onPeerHandshake: ((PeerHandshake) -> Unit)? = null
 
+    /** Parsed DETECT, including fragmented/coalesced stream input; opt-in virtual-link policy. */
+    var onPeerDetect: ((Long) -> Unit)? = null
+
     /**
      * 是否在「对端明显拒绝链路」时立即终止（默认开）。
      *
@@ -258,12 +264,13 @@ class Iap2LinkEngine(
     private val unacknowledged = ArrayList<Packet>()
     private val sendBacklog = ArrayDeque<Packet>()
     private val pendingEvents = ArrayDeque<Event>()
-    private val output = ByteArrayOutputStream()
+    private val output = ArrayDeque<ByteArray>()
     private val receive = ReceiveBuffer()
 
     private var markerDeadline: Long? = null
     private var syncDeadline: Long? = null
     private var retransmitDeadline: Long? = null
+    private var pendingAcknowledgement = false
 
     /** 上一次回显 SYN 时对端的 SYN 序号与我方序号（重传同一 SYN 时原样重放）。 */
     private var lastEchoPeerSequence: Int? = null
@@ -284,6 +291,9 @@ class Iap2LinkEngine(
 
     /** 本方当前声明的发送窗口（0x7F；仅诊断日志用）。 */
     val declaredSendWindow: Int get() = declaredMaxOutgoing
+    val queuedControlPackets: Int get() = sendBacklog.size
+    val outstandingPackets: Int
+        get() = lastSentAcknowledged?.let { sequenceDistance(sentSequence, it) } ?: 0
 
     /**
      * 对端在 sync 里声明的 RTO（毫秒）。采纳后**用它当本地重传节拍**，不再用构造默认值。
@@ -378,6 +388,39 @@ class Iap2LinkEngine(
         state = State.NEGOTIATING
     }
 
+    /**
+     * Forget the old link epoch after a peer DETECT in NORMAL. Do not discard receive bytes:
+     * the same transport write may already contain the next SYN after that DETECT.
+     */
+    fun restartResponder() {
+        state = State.NEGOTIATING
+        peerSynchronization = null
+        adoptedSynchronization = null
+        adoptedPeerControlSessionId = null
+        peerRetransmissionTimeoutMillis = null
+        peerHandshakeRejections = 0
+        declaredMaxOutgoing = maxOutgoing
+        originatedSyn = false
+        sentSequence = randomInitialSequence()
+        lastSentAcknowledged = null
+        lastReceivedInOrder = 0
+        lastEchoPeerSequence = null
+        heldSinceMillis = null
+        markerDeadline = null
+        syncDeadline = null
+        retransmitDeadline = null
+        pendingAcknowledgement = false
+        output.clear()
+        unacknowledged.clear()
+        sendBacklog.clear()
+        pendingEvents.clear()
+    }
+
+    /** Respond only to received DETECT; never arm periodic responder DETECT retransmission. */
+    fun respondToDetect() {
+        appendOutput(MARKER)
+    }
+
     fun feed(
         bytes: ByteArray,
         nowMillis: Long,
@@ -402,9 +445,21 @@ class Iap2LinkEngine(
     fun feedEof() = die(null)
 
     fun takeOutput(): ByteArray {
-        val bytes = output.toByteArray()
-        output.reset()
+        flushPendingAcknowledgement()
+        val bytes = ByteArray(output.sumOf { it.size })
+        var offset = 0
+        while (output.isNotEmpty()) {
+            val frame = output.removeFirst()
+            frame.copyInto(bytes, offset)
+            offset += frame.size
+        }
         return bytes
+    }
+
+    /** Message transports must deliver each original DETECT/link frame independently. */
+    fun pollOutputFrame(): ByteArray? {
+        flushPendingAcknowledgement()
+        return if (output.isEmpty()) null else output.removeFirst()
     }
 
     fun pollEvent(): Event? = if (pendingEvents.isEmpty()) null else pendingEvents.removeFirst()
@@ -488,7 +543,7 @@ class Iap2LinkEngine(
             }
             if (receive.size < 2) break
             if (receive[1] == 0x5A.toByte()) break
-            if (!consumeHandshakePacket()) return false
+            if (!consumeHandshakePacket(nowMillis)) return false
             if (state == State.DEAD) return false
         }
         if (receive.size < HEADER_BYTES) return false
@@ -566,15 +621,9 @@ class Iap2LinkEngine(
                     adoptedPeerControlSessionId = it.id
                 }
                 lastReceivedInOrder = sequence
-                // **每次** SYN 都只回一帧 SYN|ACK（不回裸 ACK）：
-                //  ① 语义完整：SYN|ACK 自带确认位与 ack 字段，裸 ACK 是冗余的
-                //     （catplay `on_recv_neg_host` 正是只发 SYN+ACK）；
-                //  ② 序号不能撞：裸 ACK 用当前 sentSequence，而 SYN|ACK 会自增，下一次
-                //     裸 ACK 就复用上一帧 SYN|ACK 的序号——BMW 把同序号帧当重复丢弃；
-                //  ③ 重传同一 SYN 时整帧原样重放，字节级幂等。
-                // 2026-10-19 BMW 00000 定谳：旧实现在首次采纳后只回裸 ACK，该车机每轮
-                // 重试都用新序号重开协商（161→191→40…），因此 14 轮全部卡在协商、
-                // 一次 0x1D00 都没走到（日志：133 条 SYN / 0 条 ACK）。
+                // SYN|ACK already carries the acknowledgement. Repeated SYN replays the
+                // same response. Bare ACKs legitimately reuse the current sequence;
+                // sequence reuse alone is not evidence that a peer dropped a packet.
                 sendSynchronizationEcho(sync, sequence)
                 if (firstAdoption) onPeerSynchronizationAdopted?.invoke(sync)
                 // 响应方（未发过 SYN）回显即视为协商完成：对端见到 SYN|ACK 后即认为
@@ -607,7 +656,7 @@ class Iap2LinkEngine(
         if (control and CONTROL_EXTENDED_ACKNOWLEDGEMENT != 0) {
             handleExtendedAcknowledgement(ack, nowMillis)
         }
-        if (control and CONTROL_ACKNOWLEDGEMENT != 0) {
+        if (control and CONTROL_ACKNOWLEDGEMENT != 0 && peerSynchronization != null) {
             handleAcknowledgement(ack, nowMillis)
         }
         val isDataFrame =
@@ -616,6 +665,8 @@ class Iap2LinkEngine(
                 (control and CONTROL_SYNCHRONIZE) == 0 &&
                 (control and CONTROL_EXTENDED_ACKNOWLEDGEMENT) == 0
         if (isDataFrame) {
+            // DETECT invalidates the previous link, even if an old data frame follows it.
+            if (peerSynchronization == null) return
             // 控制消息的会话 ID：本国表 10 或采纳表（Audi=1；测试台两者一致）
             if (sessionId == SESSION_CONTROL || sessionId == adoptedPeerControlSessionId) {
                 // 收到对端的数据即代表对端认为链路可用；ACK 帧若丢失/被跳过，这里兜底进入 NORMAL
@@ -640,11 +691,12 @@ class Iap2LinkEngine(
      * [HANDSHAKE_REJECTION_LIMIT] 次、且此时我们连一条对端 LSP 都还没采纳
      * （= 参数协商根本没开始），才判「对端拒绝链路」并立即终止。
      */
-    private fun consumeHandshakePacket(): Boolean {
+    private fun consumeHandshakePacket(nowMillis: Long): Boolean {
         if (receive.size >= MARKER.size &&
             (0 until MARKER.size).all { receive[it] == MARKER[it] }
         ) {
             receive.discard(MARKER.size)
+            onPeerDetect?.invoke(nowMillis)
             return true
         }
         if (receive.size < 4) return false
@@ -745,8 +797,8 @@ class Iap2LinkEngine(
      * 0x7F）。maxLength 保持对端值（=我们的收包上限，勿放大）。
      */
     private fun ownSyncOf(peer: SynchronizationPayload): SynchronizationPayload =
-        peer.copy(maxOutgoing = PHONE_DECLARED_MAX_OUTGOING).also {
-            declaredMaxOutgoing = PHONE_DECLARED_MAX_OUTGOING
+        peer.copy(maxOutgoing = declaredWindow).also {
+            declaredMaxOutgoing = declaredWindow
         }
 
     private fun sendSynchronizationEcho(
@@ -856,7 +908,7 @@ class Iap2LinkEngine(
      * ACK。若哪天「奥迪忽然连不上」，先回到这里看是不是这一步引起的。
      */
     private fun effectiveSendWindow(peer: SynchronizationPayload?): Int =
-        if (peer != null && peer.maxRetransmissions > 0) {
+        if (peer != null && (reliableTransport && !echoFirst || peer.maxRetransmissions > 0)) {
             minOf(declaredMaxOutgoing, peer.maxOutgoing.coerceAtLeast(1))
         } else {
             declaredMaxOutgoing
@@ -911,7 +963,7 @@ class Iap2LinkEngine(
             if (peer == null || peer.maxRetransmissions > 0) {
                 unacknowledged += packet
                 retransmitDeadline = packet.deadlineMillis
-            } else {
+            } else if (!reliableTransport || echoFirst) {
                 lastSentAcknowledged = sentSequence
             }
         }
@@ -978,7 +1030,17 @@ class Iap2LinkEngine(
     }
 
     private fun sendAcknowledgement() {
+        if (reliableTransport) {
+            pendingAcknowledgement = true
+            return
+        }
         writePacket(null, sentSequence, CONTROL_ACKNOWLEDGEMENT, 0)
+    }
+
+    private fun flushPendingAcknowledgement() {
+        if (pendingAcknowledgement) {
+            writePacket(null, sentSequence, CONTROL_ACKNOWLEDGEMENT, 0)
+        }
     }
 
     private fun writePacket(
@@ -988,6 +1050,8 @@ class Iap2LinkEngine(
         sessionId: Int,
     ) {
         if (state == State.DEAD) return
+        // A CSM reply confirms the receive watermark without an extra POST /command.
+        if (control and CONTROL_ACKNOWLEDGEMENT != 0) pendingAcknowledgement = false
         onFrameSent?.invoke(control, sequence, lastReceivedInOrder, sessionId, payload?.size ?: 0)
         val length = payload?.size?.plus(HEADER_BYTES + 1) ?: HEADER_BYTES
         val frame = ByteArray(length)
@@ -1017,7 +1081,7 @@ class Iap2LinkEngine(
         markerDeadline = null
         syncDeadline = null
         retransmitDeadline = null
-        output.reset()
+        output.clear()
         pendingEvents.clear()
         sendBacklog.clear()
         pendingEvents += Event.Dead(reason)
@@ -1025,7 +1089,7 @@ class Iap2LinkEngine(
 
     private fun appendOutput(bytes: ByteArray): Boolean {
         if (state == State.DEAD) return false
-        output.write(bytes)
+        output.addLast(bytes)
         return true
     }
 

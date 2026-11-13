@@ -1,105 +1,251 @@
 package io.github.shaonialife.carptocar.util
 
 import android.content.Context
+import android.util.Log
 import java.io.File
-import java.io.FileWriter
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.FilterInputStream
+import java.io.OutputStream
+import java.io.OutputStreamWriter
+import java.io.Reader
+import java.io.SequenceInputStream
+import java.nio.CharBuffer
 import java.text.SimpleDateFormat
+import java.util.Collections
 import java.util.Date
 import java.util.Locale
 
 /**
- * 全局调试文件日志（files/main_debug.log）。
- *
- * 荣耀机型 logcat 被 HKS 加密，本文件是 adb 侧唯一调试通道（run-as 读取）。
- * MainActivity 与 CarPlayService（投影生命周期诊断）共用同一把锁，避免同文件并发写交叉。
+ * Shared diagnostic log, including on devices whose logcat is encrypted.
+ * main_debug.log remains the active file; .1 is its immediate predecessor.
  */
 object DebugFileLog {
     private val lock = Any()
     private val timestamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
-    /**
-     * 「本次进程启动」标记行。日志文件跨进程保留（最多 2MB），用户反馈问题时
-     * 历史轮次的日志会把真正有用的部分淹没——导出默认只取最后一条标记之后的内容。
-     * 标记本身写进文件而不是只记内存偏移：文件可能被 2MB 截断，偏移会失效。
-     */
+    // Eight 2 MiB segments retain at most 16 MiB across processes. Only capacity eviction
+    // removes history; rotation must never impersonate a real process startup.
+    private const val SEGMENT_BYTES = 2L * 1024 * 1024
+    private const val SEGMENT_COUNT = 8
+    private const val RETAINED_BYTES = SEGMENT_BYTES * SEGMENT_COUNT
+    private const val FILE_NAME = "main_debug.log"
+
     const val SESSION_MARKER = "===== CarPToCarL 进程启动（本次日志起点）====="
-
-    /**
-     * 改名前的标记（应用曾叫 CarDeck）。**故意保留旧字符串**：设备上可能存着旧版本写的
-     * 日志文件，那时标记是旧名。只认新名会让这些文件退化成「无标记 = 返回全文」，
-     * 用户导出历史日志时反而多出大量无关内容。
-     */
     internal const val LEGACY_SESSION_MARKER = "===== CarDeck 进程启动（本次日志起点）====="
+    private val markers = arrayOf(SESSION_MARKER, LEGACY_SESSION_MARKER)
 
-    /**
-     * 写入本次启动标记。由 [io.github.shaonialife.carptocar.SenderApp.onCreate] 调用一次；
-     * 重复调用会产生多条标记，导出仍取最后一条，行为安全。
-     */
+    /** Called once by SenderApp; build identity is appended by that same startup path. */
     fun markSessionStart(context: Context) {
         append(context, SESSION_MARKER)
     }
 
-    /**
-     * 读取日志正文。[currentSessionOnly] = true 时只返回最后一条 [SESSION_MARKER]
-     * 之后的内容（无标记时返回全文——首次安装/旧版本文件都属这种情形）。
-     */
-    fun read(
-        context: Context,
-        currentSessionOnly: Boolean,
-    ): String? =
-        runCatching {
-            val text = File(context.filesDir, "main_debug.log").readText(Charsets.UTF_8)
-            if (currentSessionOnly) currentSessionSlice(text) else text
-        }.getOrNull()
-
-    /**
-     * 取最后一条启动标记之后的内容（纯函数，单测覆盖边界）。
-     * 无标记 → 全文：旧版本写入的文件里没有标记，此时全量比空更好。
-     */
-    internal fun currentSessionSlice(text: String): String {
-        // 新旧两种标记都认，取最靠后的那个：同一个文件里可能前半段是旧版本写的。
-        val best =
-            listOf(SESSION_MARKER, LEGACY_SESSION_MARKER)
-                .map { marker -> marker to text.lastIndexOf(marker) }
-                .filter { it.second >= 0 }
-                .maxByOrNull { it.second }
-                ?: return text
-        return text.substring(best.second + best.first.length)
+    fun append(context: Context, message: String) {
+        try {
+            append(context.filesDir, message)
+        } catch (error: Exception) {
+            Log.w("DebugFileLog", "append failed", error)
+        }
     }
 
-    fun append(
-        context: Context,
-        message: String,
-    ) {
+    /** File-system seam shared by the Android writer and retention replay. */
+    internal fun append(filesDir: File, message: String) {
+        synchronized(lock) {
+            OutputStreamWriter(SegmentOutputStream(filesDir), Charsets.UTF_8).use { writer ->
+                writer.append('[').append(timestamp.format(Date())).append("] ")
+                // Writer.append(String) may allocate a char array as large as the record.
+                // Bounded writes also allow unusually large records to span segments.
+                var offset = 0
+                while (offset < message.length) {
+                    val count = minOf(8192, message.length - offset)
+                    writer.write(message, offset, count)
+                    offset += count
+                }
+                writer.append('\n')
+            }
+        }
+    }
+
+    /**
+     * Streams a fixed-length snapshot oldest first. CURRENT selects after the last real
+     * startup marker, even when it precedes or straddles a segment boundary. If that marker
+     * has normally aged out, all retained text is from that same process and is included.
+     * Returns whether nonblank text was written. Input/output failures propagate to export.
+     */
+    fun appendAvailable(out: Appendable, filesDir: File, currentSessionOnly: Boolean): Boolean {
+        val available = ArrayList<Segment>()
         try {
+            // Open descriptors under the writer lock, but never hold it while writing a slow
+            // export. Renaming/unlinking cannot invalidate these open, size-limited views.
             synchronized(lock) {
-                val file = File(context.filesDir, "main_debug.log")
-                // 超限直接删会连「本次启动」标记一起丢（导出就退化为全量历史）。
-                // 删后立即重写一条标记，保证截断后的新文件仍能按会话切分。
-                if (file.length() > 2_000_000) {
-                    file.delete()
-                    FileWriter(
-                        file,
-                        true,
-                    ).use {
-                        it
-                            .append('[')
-                            .append(timestamp.format(Date()))
-                            .append("] ")
-                            .append(SESSION_MARKER)
-                            .append('\n')
+                for (file in files(filesDir)) {
+                    val input = FileInputStream(file)
+                    try {
+                        available.add(Segment(input, input.channel.size()))
+                    } catch (error: Exception) {
+                        input.close()
+                        throw error
                     }
                 }
-                FileWriter(file, true).use { writer ->
-                    writer
-                        .append('[')
-                        .append(timestamp.format(Date()))
-                        .append("] ")
-                        .append(message)
-                        .append('\n')
+            }
+            val start = if (currentSessionOnly) {
+                reader(available).use(::lastMarkerEnd)
+            } else {
+                0L
+            }
+            var hasText = false
+            var lastChar: Char? = null
+            reader(available).use { source ->
+                var remaining = start
+                val buffer = CharArray(8192)
+                while (true) {
+                    val count = source.read(buffer)
+                    if (count < 0) break
+                    val skipped = minOf(remaining, count.toLong()).toInt()
+                    remaining -= skipped
+                    if (skipped == count) continue
+                    for (index in skipped until count) {
+                        if (!buffer[index].isWhitespace()) hasText = true
+                    }
+                    out.append(CharBuffer.wrap(buffer, skipped, count - skipped))
+                    lastChar = buffer[count - 1]
                 }
             }
-        } catch (_: Throwable) {
+            if (lastChar != null && lastChar != '\n') out.append('\n')
+            return hasText
+        } finally {
+            available.forEach { it.input.close() }
+        }
+    }
+
+    private data class Segment(val input: FileInputStream, val size: Long)
+
+    private fun reader(segments: List<Segment>): Reader {
+        val inputs = segments.map { segment ->
+            segment.input.channel.position(0)
+            object : FilterInputStream(segment.input) {
+                private var remaining = segment.size
+
+                override fun read(): Int {
+                    if (remaining == 0L) return -1
+                    val value = `in`.read()
+                    if (value >= 0) remaining--
+                    return value
+                }
+
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                    if (length == 0) return 0
+                    if (remaining == 0L) return -1
+                    val count = `in`.read(buffer, offset, minOf(length.toLong(), remaining).toInt())
+                    if (count > 0) remaining -= count
+                    return count
+                }
+
+                // Two passes share the snapshot descriptors; appendAvailable owns closing.
+                override fun close() = Unit
+            }
+        }
+        return SequenceInputStream(Collections.enumeration(inputs)).reader(Charsets.UTF_8).buffered()
+    }
+
+    private fun lastMarkerEnd(source: Reader): Long {
+        val overlap = markers.maxOf { it.length } - 1
+        val buffer = CharArray(8192 + overlap)
+        var carry = 0
+        var readChars = 0L
+        var end = 0L
+        while (true) {
+            val count = source.read(buffer, carry, 8192)
+            if (count < 0) return end
+            val available = carry + count
+            for (marker in markers) {
+                for (offset in 0..available - marker.length) {
+                    if (buffer[offset] != marker[0]) continue
+                    var index = 1
+                    while (index < marker.length && buffer[offset + index] == marker[index]) index++
+                    if (index == marker.length) {
+                        end = maxOf(end, readChars - carry + offset + marker.length)
+                    }
+                }
+            }
+            readChars += count
+            carry = minOf(overlap, available)
+            buffer.copyInto(buffer, 0, available - carry, available)
+        }
+    }
+
+    /** Oldest first, independently of mtime; missing/empty segments are harmless. */
+    private fun files(root: File): List<File> =
+        (SEGMENT_COUNT - 1 downTo 0).map { segmentFile(root, it) }.filter { it.isFile }
+
+    private fun segmentFile(root: File, index: Int): File =
+        File(root, if (index == 0) FILE_NAME else "$FILE_NAME.$index")
+
+    private fun rotate(root: File) {
+        val oldest = segmentFile(root, SEGMENT_COUNT - 1)
+        if (oldest.exists()) check(oldest.delete()) { "Cannot evict ${oldest.name}" }
+        for (index in SEGMENT_COUNT - 2 downTo 0) {
+            val source = segmentFile(root, index)
+            if (source.exists()) {
+                check(source.renameTo(segmentFile(root, index + 1))) { "Cannot rotate ${source.name}" }
+            }
+        }
+        // A pre-upgrade active log may already exceed the new segment size. Keep it intact
+        // until ordinary total-capacity eviction, rather than deleting its first failure.
+        val retained = files(root)
+        var bytes = retained.sumOf { it.length() }
+        for (file in retained) {
+            if (bytes <= RETAINED_BYTES - SEGMENT_BYTES) break
+            val length = file.length()
+            check(file.delete()) { "Cannot evict ${file.name}" }
+            bytes -= length
+        }
+    }
+
+    /** UTF-8 writes stay bounded without a whole-record byte-array copy. */
+    private class SegmentOutputStream(private val root: File) : OutputStream() {
+        private var output: FileOutputStream? = null
+        private var size = segmentFile(root, 0).length()
+
+        override fun write(value: Int) {
+            if (size >= SEGMENT_BYTES) {
+                output?.close()
+                output = null
+                rotate(root)
+                size = 0
+            }
+            val stream = output ?: FileOutputStream(segmentFile(root, 0), true).also { output = it }
+            stream.write(value)
+            size++
+        }
+
+        override fun write(buffer: ByteArray, offset: Int, length: Int) {
+            var position = offset
+            val end = offset + length
+            while (position < end) {
+                var count = minOf(end - position.toLong(), SEGMENT_BYTES - size).coerceAtLeast(0).toInt()
+                // Never split a UTF-8 code point, so main_debug.log itself stays readable.
+                while (count > 0 && position + count < end &&
+                    buffer[position + count].toInt() and 0xc0 == 0x80
+                ) {
+                    count--
+                }
+                if (count == 0) {
+                    output?.close()
+                    output = null
+                    rotate(root)
+                    size = 0
+                    continue
+                }
+                val stream = output ?: FileOutputStream(segmentFile(root, 0), true).also { output = it }
+                stream.write(buffer, position, count)
+                position += count
+                size += count
+            }
+        }
+
+        override fun close() {
+            output?.close()
         }
     }
 }

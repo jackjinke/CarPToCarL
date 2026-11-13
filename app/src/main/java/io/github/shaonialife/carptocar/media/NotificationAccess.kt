@@ -30,6 +30,21 @@ object NotificationAccess {
     /** 本应用监听器组件（`包/类` 形式，`cmd notification allow_listener` 需要的格式）。 */
     fun componentSpec(context: Context): String = ComponentName(context, MediaListenerService::class.java).flattenToString()
 
+    /** Authoritative permission query; a successful rebind request is not a permission grant. */
+    fun isGranted(context: Context): Boolean {
+        val allowed =
+            context.getSystemService(android.app.NotificationManager::class.java)
+                .isNotificationListenerAccessGranted(MediaListenerService.componentName(context))
+        granted = allowed
+        if (!allowed) {
+            serviceConnected = false
+            MediaSessionsState.accessGranted = false
+            MediaSessionsState.activeController = null
+            MediaSessionsState.publish(null)
+        }
+        return allowed
+    }
+
     /**
      * 从系统设置串判断本应用是否已在授权列表里。
      *
@@ -197,6 +212,13 @@ object NotificationAccess {
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastRebindRequestAt < REBIND_MIN_INTERVAL_MS) return false
         lastRebindRequestAt = now
+        if (!isGranted(context)) {
+            if (now - lastRebindLogAt >= REBIND_LOG_INTERVAL_MS) {
+                lastRebindLogAt = now
+                log("MEDIA: 通知使用权未授予——请在系统设置「通知使用权」开启；重绑不能代替授权")
+            }
+            return false
+        }
         return runCatching {
             android.service.notification.NotificationListenerService.requestRebind(
                 MediaListenerService.componentName(context),

@@ -5,141 +5,281 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/**
- * 资源归属状态机：`/info.modes` 是初始值、`changeModes` 按转移语义改、回报的是实际归属。
- *
- * 为什么锁这些：旧实现每次 `modesChanged` 都发同一段写死的常量（手机永久持有主屏+主音频），
- * 车机说「我接管」「我还给你」「我借一下」，我们一律回「屏永远是我的」。真车会发这两条——
- * 奥迪 4260 在 2026-11-09 09:38/09:42/09:43 共 7 次 `changeModes` + 1 次 `requestUI`，
- * 且 `/info.modes` 里就写着 `resourceID=1 transferType=1 takeConstraint=100`。
+/** Failure modes: silent background takeover; losing permanent ownership on borrow;
+ * duplicate named borrow; early anonymous return; partial invalid commit; rejected/stale
+ * publication claiming resources; screen recovery stealing audio; state leaking across sessions;
+ * mixed nested borrow constraints; local app state masking and restoring car state;
+ * unrelated app-state invalidation retry versus denial or car-selected radio;
+ * explicit car TAKE superseding in-flight media claims across reconnect and helper overlap.
  */
 class AirPlayResourceStateTest {
-    /** 奥迪 4260 的 /info.modes 原文形态（截取 resources 部分，值取自 11-09 09:38 日志）。 */
-    private fun audiModes() =
-        mapOf<Any?, Any?>(
-            "appStates" to
-                listOf(
-                    mapOf<Any?, Any?>("appStateID" to 2, "state" to false),
-                    mapOf<Any?, Any?>("speechMode" to -1, "appStateID" to 1),
-                    mapOf<Any?, Any?>("appStateID" to 3, "state" to false),
-                ),
-            "resources" to
-                listOf(
-                    mapOf<Any?, Any?>(
-                        "transferPriority" to 100,
-                        "takeConstraint" to 100,
-                        "resourceID" to 1,
-                        "transferType" to 1,
-                    ),
-                    mapOf<Any?, Any?>(
-                        "takeConstraint" to 100,
-                        "resourceID" to 2,
-                        "transferType" to 1,
-                    ),
-                ),
-        )
+    @Test
+    fun `car TAKE cancels an in-flight first media claim but not an unclaimed episode`() {
+        val episodes = CarPlayAudioEpisodes()
+        episodes.setPlayback(media = true, navigation = false)
+        val episode = episodes.snapshot().media!!
+        episodes.carTookAudio()
+        assertTrue(episode.isCurrent)
+        val claimRevision = episodes.beginAudioClaim(episode)
+        val state = AirPlayResourceState()
+        var firstPublication = true
+        val acquired = state.acquireAudio(500, isCurrentIntent = { episode.isCurrent }) {
+            if (firstPublication) {
+                firstPublication = false
+                state.change(mapOf("resources" to listOf(take(2))))
+                episodes.carTookAudio()
+            }
+            true
+        }
+        episodes.finishAudioClaim(episode, acquired, claimRevision)
+        assertFalse(acquired)
+        assertFalse(episode.isCurrent)
+        assertFalse(state.hasAudio())
+        episodes.setPlayback(media = true, navigation = false)
+        assertEquals(null, episodes.snapshot().media)
+        episodes.setPlayback(media = false, navigation = false)
+        episodes.setPlayback(media = true, navigation = false)
+        assertTrue(episodes.snapshot().media?.isCurrent == true)
+    }
 
     @Test
-    fun `车机没给 modes 时保持手机持有，与改动前的常量一致`() {
+    fun `retiring helper cannot clear replacement helper claim protection`() {
+        val episodes = CarPlayAudioEpisodes()
+        episodes.setPlayback(media = true, navigation = false)
+        val episode = episodes.snapshot().media!!
+        val oldClaim = episodes.beginAudioClaim(episode)
+        val replacementClaim = episodes.beginAudioClaim(episode)
+        episodes.finishAudioClaim(episode, acquired = false, expectedCarTakeRevision = oldClaim)
+        episodes.carTookAudio()
+        assertFalse(episode.isCurrent)
+        episodes.finishAudioClaim(episode, acquired = false, expectedCarTakeRevision = replacementClaim)
+        episodes.setPlayback(media = true, navigation = false)
+        assertEquals(null, episodes.snapshot().media)
+    }
+
+    @Test
+    fun `advertised car ownership survives explicit phone screen acquisition`() {
         val state = AirPlayResourceState()
+        assertTrue(state.initialize(mapOf("resources" to listOf(take(1), take(2)))))
+        assertResource(state, 1, 2, 2)
+        assertResource(state, 2, 2, 2)
+        assertTrue(state.acquireScreen())
+        assertResource(state, 1, 1, 1)
+        assertResource(state, 2, 2, 2)
+    }
+
+    @Test
+    fun `initial permanent snapshot and forbidden take constrain requests`() {
+        val state = AirPlayResourceState()
+        assertTrue(state.initialize(mapOf("initialPermanentEntity" to listOf(
+            mapOf("resourceID" to 1, "permanentEntity" to 2, "takeConstraint" to 1000),
+        ))))
+        assertFalse(state.acquireScreen())
+        assertResource(state, 1, 2, 2)
+        assertTrue(state.initialize(mapOf("resources" to listOf(
+            mapOf("resourceID" to 1, "permanentEntity" to 2, "entity" to 2, "takeConstraint" to 100),
+        ))))
+        assertTrue(state.acquireScreen())
+    }
+
+    @Test
+    fun `media intent can acquire user constrained audio while background cannot`() {
+        val state = AirPlayResourceState()
+        state.initialize(mapOf("resources" to listOf(take(1), take(2))))
+        assertFalse(state.acquireAudio())
+        assertResource(state, 2, 2, 2)
+        assertTrue(state.acquireAudio(priority = 500))
+        assertResource(state, 2, 1, 1)
+        assertResource(state, 1, 2, 2)
+    }
+
+    @Test
+    fun `navigation temporarily borrows audio and returns it to the car`() {
+        val state = AirPlayResourceState()
+        state.initialize(mapOf("resources" to listOf(take(2))))
+        assertTrue(state.acquireAudio(priority = 500, temporary = true))
+        assertResource(state, 2, 1, 2)
+        assertTrue(state.releaseAudioBorrow { true })
+        assertResource(state, 2, 2, 2)
+        assertTrue(state.acquireAudio(priority = 500, temporary = true))
+        assertTrue(state.acquireAudio(priority = 500))
+        assertTrue(state.releaseAudioBorrow { true })
+        assertResource(state, 2, 1, 1)
+    }
+
+    @Test
+    fun `Never constraints reject media and temporary requests without publishing`() {
+        val state = AirPlayResourceState()
+        state.initialize(mapOf("resources" to listOf(take(2, 1000, 1000))))
+        val publish: (Map<String, Any?>) -> Boolean = { throw AssertionError("Forbidden ownership was published") }
+        assertFalse(state.acquireAudio(500, false, publish = publish))
+        assertFalse(state.acquireAudio(500, true, publish = publish))
+        assertResource(state, 2, 2, 2)
+    }
+
+    @Test
+    fun `rejected publication leaves car ownership unchanged`() {
+        val state = AirPlayResourceState()
+        state.initialize(mapOf("resources" to listOf(take(2))))
+        assertFalse(state.acquireAudio(500, false) { false })
+        assertFalse(state.hasAudio())
+        assertResource(state, 2, 2, 2)
+        assertTrue(state.acquireAudio(500, false) { true })
+        assertTrue(state.hasAudio())
+    }
+
+    @Test
+    fun `car change during publication invalidates pending acquisition`() {
+        val state = AirPlayResourceState()
+        state.initialize(mapOf("resources" to listOf(take(2))))
+        assertFalse(state.acquireAudio(500, false) {
+            assertFalse(state.hasAudio())
+            assertEquals(0L, state.change(mapOf("resources" to listOf(take(2, 1000))))["status"])
+            true
+        })
+        assertResource(state, 2, 2, 2)
+        assertFalse(state.acquireAudio(500))
+    }
+
+    @Test
+    fun `app state invalidation requests a retry without committing stale audio`() {
+        val state = AirPlayResourceState()
+        state.initialize(mapOf("resources" to listOf(take(2))))
+        var retry = false
+        assertFalse(state.acquireAudio(500, onInvalidated = { retry = true }) {
+            state.setOwnSpeech(AirPlaySpeechMode.RECOGNIZING)
+            true
+        })
+        assertTrue(retry)
+        assertFalse(state.hasAudio())
+        assertTrue(state.acquireAudio(500) { announcement ->
+            val speech = (announcement["appStates"] as List<*>).map { it as Map<*, *> }
+                .first { it["appStateID"] == 1L }
+            assertEquals(2L, speech["speechMode"])
+            true
+        })
+        state.change(mapOf("resources" to listOf(take(2))))
+        retry = false
+        assertFalse(state.acquireAudio(500, onInvalidated = { retry = true }) {
+            // Re-selecting the same radio ownership must still defeat the pending request.
+            state.change(mapOf("resources" to listOf(take(2))))
+            true
+        })
+        assertFalse(retry)
+        assertFalse(state.hasAudio())
+        assertFalse(state.acquireAudio(500, onInvalidated = { retry = true }) { false })
+        assertFalse(retry)
+    }
+
+    @Test
+    fun `app state invalidation requests navigation return and screen claim retries`() {
+        val state = AirPlayResourceState()
+        state.initialize(mapOf("resources" to listOf(take(1), take(2))))
+        assertTrue(state.acquireAudio(500, temporary = true))
+        var retryReturn = false
+        assertFalse(state.releaseAudioBorrow(onInvalidated = { retryReturn = true }) {
+            state.setOwnSpeech(AirPlaySpeechMode.SPEAKING)
+            true
+        })
+        assertTrue(retryReturn)
+        assertResource(state, 2, 1, 2)
+        assertTrue(state.releaseAudioBorrow { true })
+        assertResource(state, 2, 2, 2)
+        var retryScreen = false
+        assertFalse(state.acquireScreen(onInvalidated = { retryScreen = true }) {
+            state.setOwnPhoneCall(true)
+            true
+        })
+        assertTrue(retryScreen)
+        assertFalse(state.hasScreen())
+        assertTrue(state.acquireScreen())
+        assertTrue(state.hasScreen())
+    }
+
+    @Test
+    fun `screen ownership commits only after accepted current publication`() {
+        val state = AirPlayResourceState()
+        state.initialize(mapOf("resources" to listOf(take(1))))
+        assertFalse(state.acquireScreen { false })
+        assertResource(state, 1, 2, 2)
+        assertFalse(state.acquireScreen {
+            assertFalse(state.hasScreen())
+            assertEquals(0L, state.change(mapOf("resources" to listOf(take(1, 1000))))["status"])
+            true
+        })
+        assertResource(state, 1, 2, 2)
+        assertFalse(state.acquireScreen())
+    }
+
+    @Test
+    fun `named screen borrows are idempotent and preserve independent audio`() {
+        val state = AirPlayResourceState()
+        val borrow = screenBorrow + ("borrowID" to "hmi")
+        repeat(2) { assertEquals(0L, state.change(mapOf("resources" to listOf(borrow)))["status"]) }
+        assertResource(state, 1, 2, 1)
+        assertResource(state, 2, 1, 1)
+        assertFalse(state.acquireScreen())
+        state.change(mapOf("resources" to listOf(mapOf("resourceID" to 1L, "transferType" to 4L, "borrowID" to "hmi"))))
+        assertResource(state, 1, 1, 1)
+    }
+
+    @Test
+    fun `nested anonymous borrow needs matching number of returns`() {
+        val state = AirPlayResourceState()
+        repeat(2) { state.change(mapOf("resources" to listOf(screenBorrow))) }
+        assertFalse(state.acquireScreen())
+        val release = mapOf("resourceID" to 1L, "transferType" to 4L)
+        state.change(mapOf("resources" to listOf(release)))
+        assertResource(state, 1, 2, 1)
+        state.change(mapOf("resources" to listOf(release)))
+        assertResource(state, 1, 1, 1)
+    }
+
+    @Test
+    fun `returning inner anonymous borrow restores outer constraint`() {
+        val state = AirPlayResourceState()
+        val outer = screenBorrow + ("unborrowConstraint" to 500L)
+        state.change(mapOf("resources" to listOf(outer)))
+        state.change(mapOf("resources" to listOf(screenBorrow)))
+        assertFalse(state.acquireScreen())
+        state.change(mapOf("resources" to listOf(mapOf("resourceID" to 1L, "transferType" to 4L))))
+        assertTrue(state.acquireScreen())
+        assertResource(state, 1, 1, 1)
+    }
+
+    @Test
+    fun `new connection resets borrowed screen and prior app states`() {
+        val state = AirPlayResourceState()
+        state.change(mapOf("resources" to listOf(screenBorrow), "appStates" to listOf(
+            mapOf("appStateID" to 1L, "speechMode" to 2L), mapOf("appStateID" to 3L, "state" to true),
+        )))
+        assertFalse(state.hasScreen())
         state.initialize(null)
-        assertTrue("没有 modes 就必须是手机持屏", state.phoneOwnsScreen)
-        assertTrue(state.phoneOwnsAudio)
-        val body = state.command().toString()
-        // 旧常量的形状：主屏/主音频 entity=1 permanentEntity=1，speechMode=-1
-        assertTrue(body, body.contains("resourceID=1, entity=1, permanentEntity=1"))
-        assertTrue(body, body.contains("resourceID=2, entity=1, permanentEntity=1"))
-        assertTrue(body, body.contains("speechMode=-1"))
+        assertTrue(state.hasScreen())
+        val apps = state.snapshot()["appStates"] as List<*>
+        assertEquals(0L, (apps.first { (it as Map<*, *>)["appStateID"] == 3L } as Map<*, *>)["entity"])
+        assertEquals(-1L, (apps.first { (it as Map<*, *>)["appStateID"] == 1L } as Map<*, *>)["speechMode"])
     }
 
     @Test
-    fun `奥迪 modes 里 transferType=1 表示主屏已被车机接管`() {
+    fun `invalid resource transaction does not partially commit`() {
         val state = AirPlayResourceState()
-        state.initialize(audiModes())
-        assertFalse("transferType=1 = 车机接管，此时不该声称手机持屏", state.phoneOwnsScreen)
-    }
-
-    @Test
-    fun `takeConstraint 允许时要得回主屏，不允许时不能硬抢`() {
-        val allowed = AirPlayResourceState()
-        allowed.initialize(audiModes()) // takeConstraint=100 在白名单里
-        allowed.requestPhoneScreen()
-        assertTrue("takeConstraint=100 允许申请主屏", allowed.phoneOwnsScreen)
-
-        val blocked = AirPlayResourceState()
-        blocked.initialize(
-            mapOf<Any?, Any?>(
-                "resources" to
-                    listOf(mapOf<Any?, Any?>("resourceID" to 1, "transferType" to 1, "takeConstraint" to 300)),
-            ),
-        )
-        blocked.requestPhoneScreen()
-        assertFalse("takeConstraint=300 表示暂不允许，不能硬声明持有", blocked.phoneOwnsScreen)
-    }
-
-    @Test
-    fun `changeModes 的四种转移语义分别生效`() {
-        val state = AirPlayResourceState()
-        state.initialize(null)
-        // 1 接管
-        state.applyCarChange(mapOf<Any?, Any?>("resources" to listOf(mapOf<Any?, Any?>("resourceID" to 1, "transferType" to 1))))
-        assertFalse("车机接管后主屏不归手机", state.phoneOwnsScreen)
-        // 2 归还
-        state.applyCarChange(mapOf<Any?, Any?>("resources" to listOf(mapOf<Any?, Any?>("resourceID" to 1, "transferType" to 2))))
-        assertTrue("车机归还后主屏归手机", state.phoneOwnsScreen)
-        // 3 借用 → 当前归属车机，但永久归属不变
-        state.applyCarChange(
-            mapOf<Any?, Any?>("resources" to listOf(mapOf<Any?, Any?>("resourceID" to 1, "transferType" to 3, "borrowID" to "b1"))),
-        )
-        assertFalse("借用期间主屏在车机手里", state.phoneOwnsScreen)
-        // 4 结束借用 → 回到永久归属（手机）
-        state.applyCarChange(
-            mapOf<Any?, Any?>("resources" to listOf(mapOf<Any?, Any?>("resourceID" to 1, "transferType" to 4, "borrowID" to "b1"))),
-        )
-        assertTrue("借用结束后回到永久归属", state.phoneOwnsScreen)
-    }
-
-    @Test
-    fun `未知 transferType 不改变任何状态`() {
-        val state = AirPlayResourceState()
-        state.initialize(null)
-        val before = state.command().toString()
-        state.applyCarChange(mapOf<Any?, Any?>("resources" to listOf(mapOf<Any?, Any?>("resourceID" to 1, "transferType" to 9))))
-        assertEquals("猜错方向比不动更糟", before, state.command().toString())
-    }
-
-    @Test
-    fun `每轮初始化会清掉上一轮被借走的屏`() {
-        val state = AirPlayResourceState()
-        state.initialize(null)
-        state.applyCarChange(
-            mapOf<Any?, Any?>("resources" to listOf(mapOf<Any?, Any?>("resourceID" to 1, "transferType" to 3, "borrowID" to "old"))),
-        )
-        assertFalse(state.phoneOwnsScreen)
-        // 新会话：车机什么都没借，不能带着上一轮的借用状态
-        state.initialize(null)
-        assertTrue(state.phoneOwnsScreen)
-    }
-
-    @Test
-    fun `报文形状与旧常量一致，只有取值来自状态`() {
-        val state = AirPlayResourceState()
-        state.initialize(audiModes())
-        val params = state.command()["params"] as Map<*, *>
-        assertEquals("resources 顺序必须是主屏在前", listOf(1L, 2L), (params["resources"] as List<*>).map { (it as Map<*, *>)["resourceID"] })
-        assertEquals("appStates 顺序沿用旧常量", listOf(2L, 3L, 1L), (params["appStates"] as List<*>).map { (it as Map<*, *>)["appStateID"] })
-        val speech = (params["appStates"] as List<*>)[2] as Map<*, *>
-        assertEquals(-1L, speech["speechMode"])
+        assertEquals(1L, state.change(mapOf("resources" to listOf(take(1), take(99))))["status"])
+        assertResource(state, 1, 1, 1)
+        assertEquals(1L, state.change(mapOf("resources" to listOf(mapOf("resourceID" to 1L, "transferType" to 1L))))["status"])
+        assertResource(state, 1, 1, 1)
+        assertEquals(1L, state.change(mapOf("resources" to listOf(mapOf("resourceID" to 1L, "transferType" to 9L))))["status"])
+        assertResource(state, 1, 1, 1)
     }
 
     // ---- 本机应用态（AIS Table 23-56 / 23-72）----
 
     @Test
-    fun `本机既不说话也不通话时，报文与改动前逐字节一致`() {
+    fun `inactive local app states report no active entity`() {
         val state = AirPlayResourceState()
         state.initialize(null)
-        val states = (state.command()["params"] as Map<*, *>)["appStates"] as List<*>
-        // 一个 entity 都不该被我们顶成 Controller，2 那条也不该多出 speechMode
+        val states = state.snapshot()["appStates"] as List<*>
+        // PhoneCall has no speechMode while inactive; Speech explicitly reports None.
         assertEquals(listOf(0L, 0L, 0L), states.map { (it as Map<*, *>)["entity"] })
         assertEquals(null, (states[0] as Map<*, *>)["speechMode"])
         assertEquals(null, (states[1] as Map<*, *>)["speechMode"])
@@ -194,6 +334,9 @@ class AirPlayResourceStateTest {
         state.setOwnSpeech(AirPlaySpeechMode.RECOGNIZING)
         assertEquals("我们自己收音时以本机为准", 1L, appState(state, 1)["entity"])
         assertEquals(2L, appState(state, 1)["speechMode"])
+        state.setOwnSpeech(AirPlaySpeechMode.NONE)
+        assertEquals("本机结束后恢复车机语音态", 2L, appState(state, 1)["entity"])
+        assertEquals(1L, appState(state, 1)["speechMode"])
     }
 
     @Test
@@ -212,17 +355,35 @@ class AirPlayResourceStateTest {
         state: AirPlayResourceState,
         id: Int,
     ): Map<*, *> =
-        ((state.command()["params"] as Map<*, *>)["appStates"] as List<*>)
+        (state.snapshot()["appStates"] as List<*>)
             .map { it as Map<*, *> }
             .first { it["appStateID"] == id.toLong() }
 
     @Test
-    fun `claimAll 是回退路径，把两块资源都收回手机`() {
+    fun `car audio release and application state changes preserve screen`() {
         val state = AirPlayResourceState()
-        state.initialize(audiModes())
-        assertFalse(state.phoneOwnsScreen)
-        state.claimAll()
-        assertTrue(state.phoneOwnsScreen)
-        assertTrue(state.phoneOwnsAudio)
+        state.change(mapOf("resources" to listOf(take(2))))
+        state.change(mapOf("resources" to listOf(mapOf("resourceID" to 2L, "transferType" to 2L)),
+            "appStates" to listOf(mapOf("appStateID" to 1L, "speechMode" to 2L), mapOf("appStateID" to 3L, "state" to true))))
+        assertResource(state, 2, 0, 0)
+        assertResource(state, 1, 1, 1)
+        val apps = state.snapshot()["appStates"] as List<*>
+        assertEquals(2L, (apps.first { (it as Map<*, *>)["appStateID"] == 1L } as Map<*, *>)["speechMode"])
+        assertEquals(2L, (apps.first { (it as Map<*, *>)["appStateID"] == 3L } as Map<*, *>)["entity"])
+    }
+
+    private val screenBorrow = mapOf("resourceID" to 1L, "transferType" to 3L,
+        "transferPriority" to 500L, "unborrowConstraint" to 1000L)
+
+    private fun take(id: Long, constraint: Long = 500, borrow: Long = 100) = mapOf(
+        "resourceID" to id, "transferType" to 1L, "transferPriority" to 500L,
+        "takeConstraint" to constraint, "borrowConstraint" to borrow,
+    )
+
+    private fun assertResource(state: AirPlayResourceState, id: Long, entity: Long, owner: Long) {
+        val resources = state.snapshot()["resources"] as List<*>
+        val resource = resources.first { (it as Map<*, *>)["resourceID"] == id } as Map<*, *>
+        assertEquals(entity, resource["entity"])
+        assertEquals(owner, resource["permanentEntity"])
     }
 }

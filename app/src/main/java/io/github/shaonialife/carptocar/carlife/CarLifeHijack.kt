@@ -204,15 +204,37 @@ object CarLifeHijack {
     @Volatile
     private var ttsSink: CarLifeAudioSink? = null
 
-    /**
-     * 引擎最近一次报「音频停」（0x30003）的时刻；0 = 当前没有停。
-     *
-     * 只用来判断恢复时要不要重新对齐车机时钟：短中断（微信提示音那种 300ms）靠补静音
-     * 就能无缝接上，**不需要**补同步包（同步包本来也常被车机 controlPort 的 ICMP 拒绝）；
-     * 只有停得久（来电挂断、路由切走）才值得重对齐。
-     */
-    @Volatile
-    private var engineAudioStopAt = 0L
+    private val audioPlaybackLock = Any()
+    private val mediaPlayback = CarLifeMediaPlayback()
+    private var mediaAudioActive = false
+    private var navigationAudioActive = false
+
+    private fun knownMediaPlaying(): Boolean? =
+        if (MediaSessionsState.accessGranted) MediaSessionsState.nowPlaying?.playing else null
+
+    private fun updateAudioPlayback(
+        media: Boolean? = null,
+        navigation: Boolean? = null,
+        newMediaIntent: Boolean = false,
+    ) {
+        synchronized(audioPlaybackLock) {
+            if (!newMediaIntent && (media == null || media == mediaAudioActive) &&
+                (navigation == null || navigation == navigationAudioActive)
+            ) return
+            if (media != null) mediaAudioActive = media
+            if (navigation != null) navigationAudioActive = navigation
+            replayAudioPlayback(newMediaIntent)
+        }
+    }
+
+    /** A reconnect reuses a live source's playback intent, rather than treating PCM as a new tap. */
+    fun replayAudioPlayback(newMediaIntent: Boolean = false) {
+        synchronized(audioPlaybackLock) {
+            io.github.shaonialife.carptocar.SessionController.onSourceAudioPlayback(
+                mediaAudioActive, navigationAudioActive, newMediaIntent,
+            )
+        }
+    }
 
     /** 最近一条 CarLife 媒体信息（0x10035，歌名/歌手/封面）。供 iAP2 0x5001 转发。 */
     @Volatile
@@ -237,11 +259,41 @@ object CarLifeHijack {
      * → 联动 [CarLifeAudioSink.setPlaybackPaused] 截断/放行音频。prewarm 时注册一次，stop 时移除。
      */
     private val mediaPlaybackListener: () -> Unit = {
-        val sink = audioSink
-        if (sink != null) {
-            // 明确 PAUSED 才截断；读不到会话（null）不截断——避免误丢引擎 PCM（本地模拟无声的坑）
-            val paused = MediaSessionsState.nowPlaying?.playing == false
-            sink.setPlaybackPaused(paused)
+        synchronized(audioPlaybackLock) {
+            if (!running.get()) return@synchronized
+            val playing = knownMediaPlaying()
+            // 源重连空窗也要接收真实暂停/播放，避免遗漏用户的新意图。
+            audioSink?.setPlaybackPaused(playing == false)
+            mediaPlayback.onSessionPlayback(playing)
+            updateAudioPlayback(media = mediaPlayback.playing)
+        }
+    }
+
+    private fun publishAudioSource(sink: CarLifeAudioSink, navigationSink: CarLifeAudioSink): Boolean =
+        synchronized(audioPlaybackLock) {
+            if (!running.get()) return@synchronized false
+            audioSink = sink
+            ttsSink = navigationSink
+            mediaPlayback.transportChanged()
+            val playing = knownMediaPlaying()
+            mediaPlayback.onSessionPlayback(playing)
+            sink.setPlaybackPaused(playing == false)
+            updateAudioPlayback(media = mediaPlayback.playing, navigation = false)
+            true
+        }
+
+    private fun retireAudioSource(sink: CarLifeAudioSink, navigationSink: CarLifeAudioSink) {
+        synchronized(audioPlaybackLock) {
+            if (audioSink === sink) {
+                audioSink = null
+                mediaPlayback.transportChanged()
+                // 传输重建不是新的播放动作；保留已消费的源播放期，避免重连抢回收音机。
+                updateAudioPlayback(media = mediaPlayback.playing)
+            }
+            if (ttsSink === navigationSink) {
+                ttsSink = null
+                updateAudioPlayback(navigation = false)
+            }
         }
     }
 
@@ -344,6 +396,10 @@ object CarLifeHijack {
     private val gop = ArrayDeque<Pair<ByteArray, Boolean>>()
     private var gopBytes = 0
     private val gopLock = Any()
+    // Cache replay and live delivery must remain one ordered producer, including
+    // VideoConfig and its first IDR. Retirement stays lock-free so it can stop a
+    // sender whose network write is blocked.
+    private val videoDeliveryLock = Any()
 
     /**
      * 最近一次见到的 SPS+PPS（含起始码）。
@@ -589,7 +645,8 @@ object CarLifeHijack {
      * 「旧 SPS + 新参考帧」的混搭）；不带 SPS 才退回旧行为等当期 IDR。
      * 开关见 [io.github.shaonialife.carptocar.video.FirstFramePolicy]（可一键回退）。
      */
-    fun attach(videoSender: VideoSender, log: (String) -> Unit) {
+    fun attach(videoSender: VideoSender, log: (String) -> Unit): Unit = synchronized(videoDeliveryLock) {
+        if (!videoSender.isRunning) return@synchronized
         logSink = log
         val pending = synchronized(gopLock) {
             val snapshot = gop.toList()
@@ -599,13 +656,6 @@ object CarLifeHijack {
         }
         // 缓存 SPS/PPS 只作兜底：当期/回放帧自带 SPS 会覆盖它。
         spsPps?.let { videoSender.seedCsd(it) }
-        // attach 期间暂存进 GOP 的帧属于上一轮时间基准，一律丢弃（不回放）。
-        val late = synchronized(gopLock) {
-            val snapshot = gop.toList()
-            gop.clear()
-            gopBytes = 0
-            snapshot
-        }
         sender = videoSender
         screenReactivateNeeded = true
         startFirstFrameWatchdog(videoSender)
@@ -618,18 +668,18 @@ object CarLifeHijack {
         if (replay) {
             log(
                 "CARLIFE: 回放缓存 ${pending.size} 帧立即起播（首帧自带 SPS，" +
-                    "策略=${FirstFramePolicy.describe()}；丢弃 attach 期间 ${late.size} 帧）",
+                    "策略=${FirstFramePolicy.describe()}；回放完成后再交接实时帧）",
             )
             var pushed = 0
             for ((frame, keyFrame) in pending) {
                 // 缓存帧本来就是旧的，不传 sourceTimestamp（避免被算成排队延迟）
-                if (videoSender.submitH264(frame, keyFrame)) pushed++ else break
+                if (sender !== videoSender || !videoSender.submitH264(frame, keyFrame)) break
+                pushed++
             }
             log("CARLIFE: 缓存回放已推送 $pushed/${pending.size} 帧——后续实时直通")
         } else {
             log(
-                "CARLIFE: 已跳过 ${pending.size + late.size} 帧缓存" +
-                    "（历史 GOP + attach 期间暂存）——" +
+                "CARLIFE: 已跳过 ${pending.size} 帧缓存——" +
                     when {
                         !FirstFramePolicy.useCachedGop -> "策略=等当期 IDR（可用偏好回退到立即起播）"
                         firstPending == null -> "缓存里没有帧，等引擎当期 IDR"
@@ -699,9 +749,13 @@ object CarLifeHijack {
         client?.stop()
         client = null
         audioSink?.stop()
-        audioSink = null
         ttsSink?.stop()
-        ttsSink = null
+        synchronized(audioPlaybackLock) {
+            audioSink = null
+            ttsSink = null
+            mediaPlayback.reset()
+            updateAudioPlayback(media = false, navigation = false)
+        }
         touchPressed = false
         gestureMoves = 0
         slot1Down = false
@@ -744,16 +798,13 @@ object CarLifeHijack {
             }
             announcedWait = false
             val sink = CarLifeAudioSink(logSink ?: {})
-            audioSink = sink
             // 导航播报走 TTS 通道（9241）：独立 sink、不参与暂停丢弃（见字段注释）
-            val naviSink = CarLifeAudioSink(logSink ?: {}, dropWhenPaused = false)
-            ttsSink = naviSink
-            // 创建即应用当前播放状态：若此刻音乐已是 PAUSED，立刻截断（否则 listener 只在
-            // 状态「变化」时触发，稳态 PAUSED 下新 sink 会漏掉这次联动）。
-            // 注意：nowPlaying == null（读不到媒体会话：未授权通知使用权 / 本地模拟无会话）
-            // 时**不能**当作「暂停」来截断——那会误丢引擎仍在推的 PCM，导致本地模拟无声。
-            // 读不到状态 = 不确定，宁可不截断（放行），交由引擎侧 STOP/DATA 自行决定。
-            sink.setPlaybackPaused(MediaSessionsState.nowPlaying?.playing == false)
+            val naviSink = CarLifeAudioSink(
+                logSink ?: {},
+                dropWhenPaused = false,
+                source = io.github.shaonialife.carptocar.audio.PcmSource.NAVIGATION,
+            )
+            if (!publishAudioSource(sink, naviSink)) return
             val hu = CarLifeHuClient(
                 host = "127.0.0.1",
                 log = { line -> logSink?.invoke(line) },
@@ -761,20 +812,47 @@ object CarLifeHijack {
                 onVideoParams = { w, h, f -> logSink?.invoke("CARLIFE: 手机编码参数 ${w}x$h@$f") },
                 // SPS 是码流的真相：确认后立刻告诉上层（界面显示、落盘快照都跟着它）。
                 onStreamSize = { w, h -> onActualStreamSize?.invoke(w, h) },
-                onAudioFormat = { rate, channels -> sink.configure(rate, channels) },
+                onAudioFormat = { rate, channels ->
+                    synchronized(audioPlaybackLock) {
+                        if (audioSink === sink) {
+                            sink.configure(rate, channels)
+                        }
+                    }
+                },
                 onAudioPcm = { pcm, size -> routeAudio(sink, pcm, size) },
                 // 导航播报：TTS 通道独立格式、独立 sink，喂给同一个音频发送端
-                onTtsFormat = { rate, channels -> naviSink.configure(rate, channels) },
-                onTtsPcm = { pcm, size ->
-                    // 只记时间戳：语音会话期间它就是「助手正在对用户说话」的证据
-                    onSpeechAudio?.invoke()
-                    routeAudio(naviSink, pcm, size)
+                onTtsFormat = { rate, channels ->
+                    synchronized(audioPlaybackLock) {
+                        if (ttsSink === naviSink) naviSink.configure(rate, channels)
+                    }
                 },
-                onAudioGate = { active -> onEngineAudioGate(active) },
-                onVoiceSession = { active -> onVoiceSession?.invoke(active) },
-                // 音频沉默看门狗判据：音乐会话确实在播 = 此刻「应该」有声，
-                // 9240 却连续零 PCM 才是异常。读不到会话（null）时按「不确定」放行不重连。
-                audioExpected = { MediaSessionsState.nowPlaying?.playing == true },
+                onTtsPcm = { pcm, size ->
+                    synchronized(audioPlaybackLock) {
+                        if (ttsSink === naviSink) {
+                            onSpeechAudio?.invoke()
+                            routeAudio(naviSink, pcm, size)
+                        }
+                    }
+                },
+                onMediaActivity = { activity -> onEngineMediaActivity(sink, activity) },
+                onVoiceSession = { active ->
+                    synchronized(audioPlaybackLock) {
+                        if (audioSink === sink) onVoiceSession?.invoke(active)
+                    }
+                },
+                onTtsGate = { active ->
+                    synchronized(audioPlaybackLock) {
+                        if (ttsSink === naviSink) {
+                            if (!active) naviSink.clearPendingPcm()
+                            updateAudioPlayback(navigation = active)
+                        }
+                    }
+                },
+                // Silence recovery requires a real session or a corroborated source episode;
+                // an idle source with unavailable notification access must not reconnect-loop.
+                audioExpected = {
+                    synchronized(audioPlaybackLock) { audioSink === sink && mediaPlayback.playing }
+                },
                 onMediaInfo = { info -> onMediaInfo(info) },
                 requestedFps = requestedFps,
                 initialConnectType = connectType,
@@ -798,6 +876,14 @@ object CarLifeHijack {
                 initialWidth = initialCanvasW,
                 initialHeight = initialCanvasH,
             )
+            // start() launches readers before its handshake completes. Fence the old
+            // decoder state first; resetting afterward can discard a new IDR already sent.
+            synchronized(videoDeliveryLock) {
+                sender?.let { target ->
+                    screenReactivateNeeded = true
+                    target.onSourceRestart("CarLife 会话重建（引擎重连）")
+                }
+            }
             if (hu.start()) {
                 client = hu
                 // SETUP 先于 client 创建的边界（requestedW/H 已缓存车机画布）：把它回放为
@@ -808,16 +894,10 @@ object CarLifeHijack {
                 }
                 // 会话建立前缓存过 SPS：立刻用它校准触摸基准，别等下一帧关键帧。
                 spsPps?.let { hu.seedSps(it) }
-                // CarPlay 会话仍在、CarLife 换了一轮（引擎掉线重连 / 用户重开「无线连接」）：
-                // 车机手里的 avcC 与参考帧都是上一轮的，必须让视频层重发 VideoConfig、
-                // 并等到新 IDR 再送帧，否则「CarPlay 不掉、CarLife 重连后永久没画面」
-                // （2026-10-25 用户实测）。首次劫持时 sender 还是 null，这里是空操作。
                 if (sender != null) {
-                    screenReactivateNeeded = true
-                    sender?.onSourceRestart("CarLife 会话重建（引擎重连）")
                     startSourceRestartWatchdog(hu)
                 }
-                logSink?.invoke("CARLIFE: 劫持成功，已接管本机 CarLife 码流（等待连接车机）")
+                logSink?.invoke("CARLIFE: 协议握手完成，等待真实源首帧（不等于已收到 CarLife 码流）")
             } else {
                 logSink?.invoke("CARLIFE: 握手失败，2 秒后重试（确认 CarLife 停在「正在连接」）")
             }
@@ -827,9 +907,8 @@ object CarLifeHijack {
             }
             if (client === hu) client = null
             sink.stop()
-            if (audioSink === sink) audioSink = null
             naviSink.stop()
-            if (ttsSink === naviSink) ttsSink = null
+            retireAudioSource(sink, naviSink)
             hasVideo = false
             if (running.get()) sleep(1500)
         }
@@ -858,41 +937,28 @@ object CarLifeHijack {
     }
 
     /**
-     * 引擎音频开停信号（0x30002 开始 / 0x30003 停止）。
-     *
-     * 真机时间线（2026-10-26）：来电时引擎发 0x30003，之后音频整段归零；挂断并恢复播放
-     * 才发 0x30002。停过一段再恢复时，车机手里的 RTP↔NTP 锚点已经超时，恢复瞬间开头
-     * 几百毫秒容易被丢——所以恢复时补发一轮同步包重新对齐。这里**不拦 PCM**：
-     * 万一信号语义判断有误，音频照常转发，不会因为猜错把声音弄没。
-     *
-     * 2026-11-09 补充（微信提示音实测）：除了来电，**提示音也会触发这一对信号**，
-     * 但只停 300ms 左右。这种短中断的真正问题不是「锚点超时」，而是「这段时间一个包都不发，
-     * 车机 jitter buffer 排空，恢复时要重新缓冲」——听感是「音乐卡一下」。
-     * 所以停的那一刻就让 [AudioSender.beginIdleFill] 立即补静音，把 RTP 时间戳续上；
-     * 恢复时只有停得久（≥[ENGINE_RESYNC_MIN_GAP_MS]）才重对齐。
+     * STOP clears the track tail but keeps its receiver clock; native PAUSE/focus release
+     * additionally gate residual MEDIA PCM. Known session PAUSED always vetoes resume.
      */
-    private fun onEngineAudioGate(active: Boolean) {
-        val audio = io.github.shaonialife.carptocar.SessionController.audioSender
-        if (!active) {
-            engineAudioStopAt = android.os.SystemClock.uptimeMillis()
-            logSink?.invoke("CARLIFE: 引擎音频已停（提示音 / 来电 / 路由切走）——立即补静音保持流连续")
-            audio?.beginIdleFill("引擎音频停止")
-            return
-        }
-        val stoppedFor =
-            if (engineAudioStopAt > 0) android.os.SystemClock.uptimeMillis() - engineAudioStopAt else 0L
-        engineAudioStopAt = 0L
-        audio?.endIdleFill()
-        when {
-            audio == null || !audio.isRunning ->
-                logSink?.invoke("CARLIFE: 引擎音频恢复，但音频通道未在运行——跳过重新对齐")
-
-            stoppedFor >= ENGINE_RESYNC_MIN_GAP_MS ->
-                audio.resyncAnchor("引擎音频恢复（停 ${stoppedFor}ms）")
-
-            else ->
-                // 短中断：静音帧已经把时间戳续上，车机侧没有空洞，不必再动锚点
-                logSink?.invoke("CARLIFE: 引擎音频恢复（停 ${stoppedFor}ms，已由静音帧续上，不重对齐）")
+    private fun onEngineMediaActivity(sink: CarLifeAudioSink, activity: CarLifeMediaActivity) {
+        synchronized(audioPlaybackLock) {
+            if (audioSink !== sink) return
+            val sessionPlaying = knownMediaPlaying()
+            sink.setPlaybackPaused(sessionPlaying == false)
+            mediaPlayback.onSessionPlayback(sessionPlaying)
+            mediaPlayback.onActivity(activity)
+            val playing = mediaPlayback.playing
+            updateAudioPlayback(
+                media = playing,
+                newMediaIntent = activity == CarLifeMediaActivity.RESUME && playing,
+            )
+            if (activity == CarLifeMediaActivity.STOP ||
+                activity == CarLifeMediaActivity.PAUSE ||
+                activity == CarLifeMediaActivity.TRANSPORT_CLOSED ||
+                activity == CarLifeMediaActivity.FOCUS_RELEASED
+            ) {
+                sink.clearPendingPcm()
+            }
         }
     }
 
@@ -989,7 +1055,7 @@ object CarLifeHijack {
         data: ByteArray,
         keyFrame: Boolean,
         sourceTimestampMs: Long,
-    ) {
+    ): Unit = synchronized(videoDeliveryLock) delivery@{
         recvWindowFrames++
         recvWindowBytes += data.size
         if (keyFrame) recvWindowKeys++
@@ -1016,14 +1082,14 @@ object CarLifeHijack {
                 noteDelivered(frame.size)
                 maybeReactivateScreen()
             }
-            return
+            return@delivery
         }
         synchronized(gopLock) {
             if (keyFrame) {
                 gop.clear()
                 gopBytes = 0
             } else if (gop.isEmpty()) {
-                return // 没有关键帧打头，非关键帧单独送过去也解不出画面
+                return@delivery // 没有关键帧打头，非关键帧单独送过去也解不出画面
             }
             gop.addLast(frame to keyFrame)
             gopBytes += frame.size
@@ -1186,31 +1252,30 @@ object CarLifeHijack {
         client?.setRequestedResolution(width, height)
     }
 
-    /**
-     * PCM 的去向判定：**只有音频通道真的在跑时才本机播放**。
-     *
-     * 本次连接若没勾「开启声音」，AirPlay 音频流不存在，本地播放只会从手机喇叭
-     * 外放（用户不想要、也白耗电），所以直接丢弃并限频提示。
-     */
+    /** Only route PCM into an established audio sender; stream creation follows explicit source events. */
     private fun routeAudio(
         sink: CarLifeAudioSink,
         pcm: ByteArray,
         size: Int,
     ) {
-        val routed = io.github.shaonialife.carptocar.SessionController.audioSender?.isRunning == true
-        if (routed) {
-            sink.write(0, 0, pcm, size)
-            return
-        }
-        audioDroppedBytes += size
-        val now = android.os.SystemClock.uptimeMillis()
-        if (now - lastAudioDropLog >= AUDIO_DROP_LOG_MS) {
-            lastAudioDropLog = now
-            logSink?.invoke(
-                "CARLIFE: 收到 CarLife 音频 ${audioDroppedBytes / 1024}KB，但本次连接未开启声音" +
-                    "（「启动连接」弹窗里勾选后即可出声）；已丢弃",
-            )
-            audioDroppedBytes = 0
+        synchronized(audioPlaybackLock) {
+            if (sink !== audioSink && sink !== ttsSink) return
+            sink.write(0, 0, pcm, size,
+                forwardingAllowed = sink !== audioSink || mediaPlayback.canForwardPcm)
+            val routed = io.github.shaonialife.carptocar.SessionController.audioSender?.isRunning == true
+            if (routed) {
+                return
+            }
+            audioDroppedBytes += size
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastAudioDropLog >= AUDIO_DROP_LOG_MS) {
+                lastAudioDropLog = now
+                logSink?.invoke(
+                    "CARLIFE: 音频通道未就绪，丢弃 ${audioDroppedBytes / 1024}KB；" +
+                        "状态=${io.github.shaonialife.carptocar.SessionController.audioStatus}",
+                )
+                audioDroppedBytes = 0
+            }
         }
     }
 
@@ -1457,14 +1522,6 @@ object CarLifeHijack {
     /** 「音频被丢弃」提示的限频（毫秒）。 */
     private const val AUDIO_DROP_LOG_MS = 10_000L
 
-    /**
-     * 引擎音频停了多久才值得「补发同步包重对齐」（毫秒）。
-     *
-     * 低于这个值（微信提示音那种 300ms 级）交给 [AudioSender.beginIdleFill] 补静音续上时间戳，
-     * 车机侧没有空洞，重对齐反而可能让它重算锚点、把刚接上的声音再抖一下。
-     * 来电挂断那种几十秒的中断才真的需要重对齐。
-     */
-    private const val ENGINE_RESYNC_MIN_GAP_MS = 2_000L
 
     private fun portListening(port: Int): Boolean = try {
         Socket().use { socket ->

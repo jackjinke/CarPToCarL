@@ -46,10 +46,9 @@ internal fun Iap2LinkChannel.runSenderSession(
         onSessionReady(session)
         session.pumpIncomingForever()
     } finally {
-        // 链路断开（保活泵退出 / run 抛错）：通知主控释放「会话处理中」——否则车机拆链
-        // 后立刻回连带来的新端点会被**僵尸轮次**堵门：车机 15s 看门狗 + 我方 WiFi 加入
-        // 长等待的窗口错配，让新端点只能干等到用户放弃（上游 0.1.14 奥迪 3315 真机定谳）。
-        onLinkClosed()
+        // Local retirement belongs to the cancelling owner. Only the current remote link
+        // may release the controller's attempt; the BT owner supplies that identity check.
+        if (!closedLocally) onLinkClosed()
     }
 }
 

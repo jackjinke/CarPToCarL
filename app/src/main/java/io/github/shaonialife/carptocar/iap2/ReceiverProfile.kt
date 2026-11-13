@@ -131,12 +131,11 @@ object ReceiverProfile {
                     WifiGen.LEGACY
                 }
 
-                (signals.sendIds?.size ?: 0) + (signals.receiveIds?.size ?: 0) >= 10 -> {
-                    // 清单齐且相当完整仍无 0x5703/0x5702——BMW iD9 形态（两清单均 10+ 项）。
-                    // 不能仅凭「未声明」判新：奥迪清单只列 CarPlay 生命周期消息（实测
-                    // 发送清单 2 项/可收 5 项，均无 0x57xx），但旧协议工作正常——
-                    // 稀疏清单不算数，保守 UNKNOWN 走旧协议（0x5703 有超时兜底）
-                    reasons += "清单完整（${(signals.sendIds?.size ?: 0) + (signals.receiveIds?.size ?: 0)} 项）仍无 0x5703/0x5702——AP 信息由 0x4301 提供"
+                signals.sendIds?.contains(Iap2MessageIds.CARPLAY_START_SESSION) == true &&
+                    (signals.sendIds.size + (signals.receiveIds?.size ?: 0)) >= 10 -> {
+                    // 丰富的媒体清单也可能完全没有无线端点消息（BMW 重连时的普通 iAP 视图）。
+                    // 只有同时声明 0x4301 才保留既有的新代快路径；否则继续兼容凭据探测。
+                    reasons += "清单声明 0x4301、未声明 0x5703/0x5702——AP 信息由 0x4301 提供"
                     WifiGen.NEW
                 }
 
@@ -149,7 +148,7 @@ object ReceiverProfile {
                     // 跳过 0x5702 直接发 0x4300，而奥迪对 0x4300 只回 ACK 不出 0x4301，等于自杀。
                     // 因此这里保持 UNKNOWN，改由发送端「两条请求并行发、谁先回用谁」兜底
                     // （Iap2SenderSession 的并行兜底）。
-                    reasons += "清单稀疏且未声明 0x5703/0x5702——不构成「新协议」证据，保守按旧协议（超时兜底）"
+                    reasons += "清单未确认 WiFi 凭据协议——保留 0x5702 与 0x4300 探测"
                     WifiGen.UNKNOWN
                 }
 

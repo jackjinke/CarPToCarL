@@ -58,9 +58,11 @@ class VirtualIap2LinkTest {
                     eventSent.add(it)
                     true
                 },
-                sendControlIap = {
-                    controlSent.add(it)
-                    allControl.add(it)
+                sendControlIap = { bytes, isCurrentEpoch ->
+                    if (isCurrentEpoch()) {
+                        controlSent.add(bytes)
+                        allControl.add(bytes)
+                    }
                 },
                 tunnelWriter = { null },
                 // 关闭节拍线程：测试内确定性驱动（无重传干扰）
@@ -194,12 +196,14 @@ class VirtualIap2LinkTest {
         val h = Harness()
         h.link.armMib3()
         val detect = h.controlSent.size
-        // 第 1 个：还不判定（MIB3 会再发一次探测重发）
+        // A responder promptly echoes DETECT. Only a later probe without SYN triggers fallback.
         h.link.onCarBytes(Iap2LinkEngine.MARKER)
-        assertEquals("首个 marker 不应额外发字节", detect, h.controlSent.size)
-        // 第 2 个：升级为 marker + 同步包
+        assertEquals(Iap2LinkEngine.MARKER.toList(), h.controlSent.last().toList())
+        assertEquals(detect + 1, h.controlSent.size)
+        val afterFirst = h.controlSent.size
+        h.clock += 1_000
         h.link.onCarBytes(Iap2LinkEngine.MARKER)
-        val sent = h.controlSent.drop(detect)
+        val sent = h.controlSent.drop(afterFirst)
         assertTrue("重复 marker 后必须补发协商字节", sent.isNotEmpty())
         val payload = sent.fold(ByteArray(0)) { acc, bytes -> acc + bytes }
         assertTrue(
@@ -403,9 +407,9 @@ class VirtualIap2LinkTest {
         h.carSends(0x1D01, Iap2Csm.string(0, "SilCar") + Iap2Csm.string(1, "SilMfr"))
         h.carSends(0xAA01, Iap2Csm.param(0, ByteArray(642)))
         assertEquals(listOf(20), h.challengeLengths())
-        // 20B 静默：推进时钟越过 6s 窗口，喂一个 marker 触发节拍检查（drainLocked）
+        // Advance the pacer without injecting a peer reset into the authenticated link epoch.
         h.clock += 7_000
-        h.link.onCarBytes(Iap2LinkEngine.MARKER)
+        h.tick()
         assertEquals(listOf(20, 32), h.challengeLengths())
         // 32B 得到应答 → 0xAA05 + 突发照常
         val after = h.controlFrames().size

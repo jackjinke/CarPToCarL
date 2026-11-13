@@ -61,6 +61,9 @@ object EndpointHosts {
         }
     }
 
+    /** Wildcard bind addresses are not remote peers; connecting to them can reach this phone. */
+    private fun isUnspecified(host: String): Boolean =
+        host == "0.0.0.0" || (isIpv6(host) && host.all { it == ':' || it == '0' })
 
     /**
      * 占位地址 / 回环地址：`0.0.0.0`、`::`、`::ffff:0.0.0.0`、`127.x`、`::1`。
@@ -77,7 +80,7 @@ object EndpointHosts {
     fun isPlaceholder(host: String): Boolean {
         val base = stripScope(host).trim().lowercase()
         if (base.isEmpty()) return true
-        if (base == "0.0.0.0" || base == "::" || base == "0:0:0:0:0:0:0:0") return true
+        if (isUnspecified(base)) return true
         if (base == "::1" || base == "0:0:0:0:0:0:0:1") return true
         if (base == "::ffff:0.0.0.0" || base == "0000:0000:0000:0000:0000:ffff:0000:0000") return true
         if (base.startsWith("127.")) return true

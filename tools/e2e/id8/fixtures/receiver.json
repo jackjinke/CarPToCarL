@@ -1,0 +1,235 @@
+{
+  "audioFormats": [
+    {
+      "audioInputFormats": 805306368,
+      "audioOutputFormats": 805306368,
+      "audioType": "default",
+      "type": 100
+    },
+    {
+      "audioInputFormats": 805306368,
+      "audioOutputFormats": 805306368,
+      "audioType": "telephony",
+      "type": 100
+    },
+    {
+      "audioInputFormats": 536870912,
+      "audioOutputFormats": 536870912,
+      "audioType": "speechRecognition",
+      "type": 100
+    },
+    {
+      "audioOutputFormats": 1073741824,
+      "audioType": "alert",
+      "type": 100
+    },
+    {
+      "audioOutputFormats": 8388608,
+      "audioType": "media",
+      "type": 102
+    },
+    {
+      "audioOutputFormats": 1073741824,
+      "audioType": "default",
+      "type": 101
+    }
+  ],
+  "audioLatencies": [
+    {
+      "audioType": "default",
+      "inputLatencyMicros": 230000,
+      "outputLatencyMicros": 72000,
+      "type": 100
+    },
+    {
+      "audioType": "telephony",
+      "inputLatencyMicros": 99000,
+      "outputLatencyMicros": 72000,
+      "type": 100
+    },
+    {
+      "audioType": "speechRecognition",
+      "inputLatencyMicros": 99000,
+      "outputLatencyMicros": 72000,
+      "type": 100
+    },
+    {
+      "audioType": "alert",
+      "outputLatencyMicros": 230000,
+      "type": 100
+    },
+    {
+      "audioType": "media",
+      "outputLatencyMicros": 230000,
+      "type": 102
+    },
+    {
+      "audioType": "default",
+      "outputLatencyMicros": 99000,
+      "type": 101
+    }
+  ],
+  "displays": [
+    {
+      "adjacentViewAreas": [],
+      "features": 10,
+      "heightPhysical": 105,
+      "heightPixels": 812,
+      "initialViewArea": 0,
+      "maxFPS": 60,
+      "primaryInputDevice": 1,
+      "type": 110,
+      "uuid": "00000000-0000-4000-8000-000000000001",
+      "viewAreas": [
+        {
+          "heightPixels": 810,
+          "originXPixels": 2,
+          "originYPixels": 0,
+          "safeArea": {
+            "drawUIOutsideSafeArea": false,
+            "heightPixels": 806,
+            "originXPixels": 2,
+            "originYPixels": 4,
+            "widthPixels": 2660
+          },
+          "viewAreaTransitionControl": false,
+          "widthPixels": 2660
+        }
+      ],
+      "widthPhysical": 345,
+      "widthPixels": 2662
+    },
+    {
+      "adjacentViewAreas": [
+        1,
+        2,
+        3
+      ],
+      "heightPhysical": 110,
+      "heightPixels": 900,
+      "initialViewArea": 0,
+      "maxFPS": 60,
+      "nightMode": 1,
+      "type": 111,
+      "uuid": "00000000-0000-4000-8000-000000000002",
+      "viewAreas": [
+        {
+          "heightPixels": 644,
+          "originXPixels": 328,
+          "originYPixels": 148,
+          "safeArea": {
+            "heightPixels": 526,
+            "originXPixels": 794,
+            "originYPixels": 192,
+            "widthPixels": 612
+          },
+          "widthPixels": 1544
+        },
+        {
+          "heightPixels": 644,
+          "originXPixels": 328,
+          "originYPixels": 148,
+          "safeArea": {
+            "heightPixels": 382,
+            "originXPixels": 794,
+            "originYPixels": 336,
+            "widthPixels": 612
+          },
+          "widthPixels": 1544
+        },
+        {
+          "heightPixels": 526,
+          "originXPixels": 34,
+          "originYPixels": 204,
+          "safeArea": {
+            "heightPixels": 526,
+            "originXPixels": 64,
+            "originYPixels": 204,
+            "widthPixels": 610
+          },
+          "widthPixels": 672
+        },
+        {
+          "heightPixels": 526,
+          "originXPixels": 34,
+          "originYPixels": 204,
+          "safeArea": {
+            "heightPixels": 394,
+            "originXPixels": 64,
+            "originYPixels": 336,
+            "widthPixels": 610
+          },
+          "widthPixels": 672
+        }
+      ],
+      "widthPhysical": 234,
+      "widthPixels": 1920
+    }
+  ],
+  "extendedFeatures": [
+    "vocoderInfo",
+    "enhancedRequestCarUI"
+  ],
+  "features": 416679199360,
+  "hidDevices": [
+    {
+      "displayUUID": "00000000-0000-4000-8000-000000000001",
+      "hidCountryCode": 0,
+      "hidDescriptor": {
+        "hex": "050d0904a101050d0922a102050d09331500250175019501810275079501810105010930150026660a75109501810209311500262c03751095018102c0c0"
+      },
+      "name": "TouchInputDescriptor",
+      "uuid": "1"
+    },
+    {
+      "displayUUID": "00000000-0000-4000-8000-000000000001",
+      "hidCountryCode": 0,
+      "hidDescriptor": {
+        "hex": "05010908a1010509090115002501750195018102050c7501950181010a2402150025017501950181027505950181010501093009311581257f750895028102050109381581257f750895018106c0"
+      },
+      "name": "HardKeyInputDescriptor",
+      "uuid": "0"
+    }
+  ],
+  "keepAliveLowPower": true,
+  "keepAliveSendStatsAsBody": true,
+  "limitedUI": false,
+  "modes": {
+    "appStates": [
+      {
+        "appStateID": 2,
+        "state": false
+      },
+      {
+        "appStateID": 1,
+        "speechMode": -1
+      },
+      {
+        "appStateID": 3,
+        "state": false
+      }
+    ],
+    "resources": [
+      {
+        "borrowConstraint": 100,
+        "resourceID": 1,
+        "takeConstraint": 500,
+        "transferPriority": 500,
+        "transferType": 1
+      },
+      {
+        "borrowConstraint": 100,
+        "resourceID": 2,
+        "takeConstraint": 500,
+        "transferPriority": 500,
+        "transferType": 1
+      }
+    ]
+  },
+  "nightMode": false,
+  "rightHandDrive": false,
+  "sourceVersion": "365.10.3",
+  "model": "MGU-93",
+  "manufacturer": "Protocol Fixture",
+  "name": "ID8 network contract"
+}

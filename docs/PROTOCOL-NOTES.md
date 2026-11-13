@@ -133,25 +133,24 @@ pi=<配对ID>  pk=<ed25519公钥hex>
 
 ## 8b. 音频通道（✅ 已实现：手机 → 车机主音频流）
 
-**协商**：在已加密的 RTSP 会话上 `SETUP`，body = `streams:[{type:100(主音频),
-streamConnectionID, audioFormat:<位图>, audioType:"media"}]`；接收端应答
-`{type:100, dataPort:<UDP>, controlPort:<UDP>, streamConnectionID}`。
-- 音频格式位图（catplay `msg/streams.rs` AudioFormat）：PCM 48k 立体声 = `1<<15`、
-  AAC-LC 48k 立体声 = `1<<23`；当前实现用 PCM 48k 立体声（协议基线）
-- 流密钥与视频同规则：`HKDF(shared, "DataStream-Salt<音频 connId>", "DataStream-Output-Encryption-Key")`
-- 音频流 ID 独立（用自己的 connId），与视频互不影响
+**协商**：在 RTSP 会话上按接收端 `/info` 的档位发送音频 `SETUP`，
+包含独立的 `streamConnectionID`、`audioFormat` 和 `audioType`。
+PCM 与 AAC 的流类型、每帧样本数分别按协商结果填写；BMW 当前回放档位是
+`type=102`、AAC-LC 48kHz 立体声、`audioFormat=1<<23`、`spf=1024`。
+- 流密钥：`HKDF(shared, "DataStream-Salt<音频 connId>", "DataStream-Output-Encryption-Key")`。
+- 音频流 ID 与视频独立；后加入或替换音频流也要完成 RECORD，再标记激活。
+- 界面区分等待取权、建流、激活与发送；发送端启动和 RECORD 成功不等于车机扬声器已出声。
 
 **线格式**（RTP over UDP；接收端 DiPlay `AudioStream.kt` 解密路径证实）：
 ```
 [RTP 头 12B][ChaCha20-Poly1305 密文 + 16B tag][8B 小端 nonce]
-头: v=2 | M=0 PT=<stream type=100> | seq u16BE | timestamp u32BE(累计样本帧) | ssrc u32BE
+头: v=2 | M=0 PT=<协商的 stream type> | seq u16BE | timestamp u32BE(累计样本帧) | ssrc u32BE
 AAD = 头字节 4..12（timestamp+ssrc 的 BE 表示，catplay "modern AAD"）
 nonce(12B) = 4 字节零 + 尾 8 字节小端计数（逐包递增）
 ```
-- 每包 512 样本帧（48000Hz 立体声 16bit = 2048B 负载，整包 ~2084B；
-  接收端 UDP 收包缓冲 4096B，安全）
-- 采集：`AudioPlaybackCapture`（Android 10+，需要 MediaProjection 授权 + RECORD_AUDIO）
-- 当前为单向（媒体/导航下车机）；麦克风上行（通话）未实现
+- AAC-LC 每包 1024 样本帧，发送裸 AAC 负载；RTP 时间戳按实际样本数推进。
+- 源端可来自 `AudioPlaybackCapture`，或 CarLife 媒体/TTS PCM；后者按各自采样率和声道重采样。
+- 麦克风只在对应档位明确声明输入能力时协商；缺失或为零时省略输入端口。
 
 **本项目代码**：`audio/AudioSender.kt`（采集+封包+UDP）、
 `airplay/AirPlayClient.runAudioStream()`（协商）、单测 `AudioSenderTest`（解密回环）
@@ -276,17 +275,31 @@ EVENT: 命令 type=requestUI params={url=}                    ×1（旧实现当
 | 来源 | 处理 |
 |---|---|
 | `/info.modes.resources[]` | 初始归属，**车机说了算**；没给就保持「手机持有」（与旧常量一致） |
-| `changeModes.transferType=1` | 车机接管，记 `takeConstraint` |
-| `transferType=2` | 归还给手机 |
-| `transferType=3` / `4` | 开始 / 结束借用（只看 `borrowID`，永久归属不变） |
-| 未知 `transferType` | **什么都不改**（猜错方向比不动更糟） |
-| `requestUI` | 把主屏交回手机（同 `requestPhoneScreen()`） |
+| `changeModes.transferType=1` / `2` | 按优先级、约束和当前归属处理 Take / Release |
+| `transferType=3` / `4` | Borrow / Unborrow；永久归属保留，具名借用去重，匿名借用按层数归还 |
+| 无效事务或未满足约束 | 拒绝整个事务并保持原状态，不留下部分资源变更 |
+| `requestUI` | 在约束允许时申请并恢复主屏；Never 约束继续生效 |
 
-发布顺序照真机：**先按车机给的归属复述 → 再申请主屏 → 状态有变才重发**。
-车机若不接受第一次复述，退回旧行为（声明手机永久持有主屏+主音频），保证不因本条退化。
+状态发布与本地申请串行；音频提案只在接收端接受、且等待期间没有更新的音频资源事件时提交。
+不以固定「手机永久持有主屏和音频」覆盖车机已确认的状态。
 
 成功判定同时改严：**RTSP 200 且报文体 `status == 0`**（无 status 字段或解析失败仍算成功）。
 旧实现只看状态行，车机回 `200 OK` + `{status:-1}` 时被当成功，现场是「都成功了，过一会儿断」。
+
+### 9c-1a. 实际播放意图与音频激活（2026-11-12）
+
+- 后台建链仍用 100 优先级；明确媒体播放用 500 永久取权，导航用临时借用，停止后归还。
+  普通 PCM、格式 INIT、重复播放状态与元数据更新不构成新的抢权许可。
+- Android 媒体会话状态优先；未知时使用 CarLife 的明确控制信号。
+  手机 CarLife 8.8.5 的 `CommonParams`、`PCMMediaManager` 和 `MusicAudioHelper` 互证：
+  媒体 `0x30002=STOP`、`0x30003=PAUSE`、`0x30004=RESUME_PLAY`。
+  原来从相邻 PCM 反推 `0x30002=START` 的结论已撤销。
+- TTS `0x40001=INIT`、`0x40002=STOP`、`0x40003=DATA`；每段播报申请一次借用，
+  重复数据不重复取权。旧音频读线程的结束和残留数据不能改变新一代的播放状态。
+- 自动源重连保留未变化的媒体意图，避免制造 false→true 抢回车机收音机；
+  重连空窗中的真实暂停/播放仍传递到当前资源工作线程。
+- 音频 SETUP、sender 替换、RECORD 与资源让出互斥；取消或客户端替换后的结果不再发布。
+
 
 ### 9c-2. `0x4300` 要走链路确认，但补不上不能拆链（2026-11-10 修正）
 
@@ -842,4 +855,62 @@ EIR 判定）→ 再开本开关试。奥迪 MIB3 固件 `CoWSupported: false`�
 日志关键词：`车机声明：可收 N 项` · `组件声明：currentLanguage=…` ·
 `0x4E0A 语言=…` · `车机可收清单未声明 0x… （bt/tunnel）… 裁掉/仍照常发送` ·
 `订阅应答 0x4157 → 0x4158` · `0x5200 → 0x5201` · `PROTO! WARN [UNSOLICITED_MESSAGE]`。
+
+## §16 资源切换、带符号整数与 BMW 拆链现场（2026-11-09）
+
+### 带符号 binary plist 整数
+
+`speechMode = -1` 表示无语音状态。旧编码器把它压成单字节 `ff`，独立 plist 解码器
+会读成 **255**；BMW 实车导出的 `modesChanged` 中观察到了这个实际报文值。负整数现
+统一使用带符号的 8 字节表示，正整数保留原有紧凑表示。回归覆盖 `-1`、负边界和正值，
+另用独立 `plistlib` 解码生产编码器输出交叉核对。
+
+### 资源归属与媒体流
+
+`CarPlayModes` 从 `/info modes` 的资源请求初始化，缺少声明时才采用控制器默认归属。
+实体 1 为手机、2 为车机；屏幕与主音频独立。接收 `changeModes` 时按 take / untake /
+borrow / unborrow、优先级和约束原子更新状态，并返回实际状态；借用保留永久所有者。
+主动启动投屏和音频分别申请各自资源，避免把车机请求变成“手机持有所有资源”的声明。
+
+`CarPlayResourceStreams` 负责资源变更的媒体效果：
+
+- 车机借屏：脱开视频源、停止该视频 sender、发送指定屏幕流的 TEARDOWN。
+- 车机还屏：重新 SETUP，使用新的 streamConnectionID/密钥和 sender，RECORD 后接回源。
+- 主音频归属独立驱动音频流暂停/恢复，保持原有音频协商时机。
+- 初始 SETUP 成功、sender 已运行、源已接入是不同状态；初始化期间借还屏也会恢复。
+- 恢复中再次借屏时，先退役已协商的新流，再按最新所有权决定下一次恢复。
+
+本地原生接收端已通过加密事件/控制/视频通路验证普通借还屏、恢复中交错借还屏及初始
+sender 尚未运行的场景；各场景恢复后的 30 帧由独立解码器逐帧核对像素。该验证覆盖
+软件协议和媒体流切换，车机实际 HMI、音频播放及持续运行仍由实车结果确认。
+
+### BMW 现场的证据边界
+
+关闭 VPN 后，BMW MGU-93 的新配对、屏幕 SETUP、media 音频 SETUP 和补发 RECORD
+均成功；拆链前仍有新的 `/feedback` 响应。音频 sampleTime 在推进，因而 controlPort
+的 ICMP 拒绝本身不足以解释整轮拆链。Wi-Fi 丢失发生在控制/事件/视频关闭之后。
+
+早间成功转接盒的 Wi-Fi iAP2 过程为车机 detect → 回显 → 车机 SYN → SYNACK → ACK →
+识别/认证；早间手机日志只保留发出的 detect 与空确认。19:06 的完整导出补齐了不同现场：
+车机 SYN seq=6、手机 SYNACK seq=19/ack=6、车机最终 ACK ack=19，随后收到身份消息。
+手机再发出 ACK + IdentificationAccepted + RequestAuthenticationCertificate，共 41 字节、
+三个长度与校验和均有效的链路包；此后只有连续 detect，没有收到认证响应。
+生产链路引擎回放确认上述序号与状态转换。成功转接盒的独立发送/索取认证序列号与此不同，
+参考实现支持字节流分帧，因此现有证据尚不足以把合包或证书请求形态单独认定为根因。
+首轮视频退出早于媒体音频 SETUP；后续重试出现音频建流和用户观察到的车机重启，
+两种失败时序分别保留，不能用后者的音频字段解释前者。
+
+## §17 输出尺寸、凭据推断与麦克风能力（19:06 后续实验）
+
+- 用户配置的输出为 **2560×800**，BMW 主屏为 **2662×812**；两者不同是正常配置。
+  该次 SPS 的 coded 与 visible 都为 2560×800，且无 frame cropping。
+  RAW/SPLIT 的 VideoConfig 解码尺寸应来自同一份 avcC 中 SPS 的 visible 值；
+  显式 CAR 覆盖仍采用车机画布，SPLIT 另写视口。GOP 缓存回放、预置 CSD 和分辨率变化
+  都走同一判定。`H264Sps` 共用解析器同时保留 coded / visible / declared 诊断。
+- 同一 BMW 重连时返回过仅普通媒体能力的 26 项清单，既无 `0x5702/0x5703`，也无
+  `0x4301`。清单条数不是无线协议的正证据；缺少 `0x4301` 时保留 UNKNOWN 的既有探测路径。
+- 该车 `/info` 的 `type=102, audioType=media` 声明输出 `0x800000`，**没有**
+  `audioInputFormats` 字段；旧摘要用默认值零打印，不能当成原文明确为零。
+  上游 `7df7a3c` 已按档位输入位图携带麦克风端口：非零才声明，缺失或零都省略。
+  本地实际 SETUP 抓取分别覆盖原始缺失值、显式零和非零媒体档；媒体名称本身不作裁决。
 

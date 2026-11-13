@@ -63,6 +63,7 @@ class CarPlayCtrlAdvertiser(
 
         /** 同一 SSID 的强制重注册冷却（见 ensureForNetwork）。 */
         private const val FORCE_COOLDOWN_MILLIS = 2_000L
+        private val invitationSerial = java.util.concurrent.atomic.AtomicLong()
     }
 
     private var serverSocket: ServerSocket? = null
@@ -131,7 +132,7 @@ class CarPlayCtrlAdvertiser(
      * 回调里**必须快速返回**（会占用应答前的窗口），耗时动作自己丢到后台线程。
      */
     @Volatile
-    var onInvite: ((receiverId: String?) -> Unit)? = null
+    var onInvite: ((CarPlayInvitationGate.Invitation) -> Unit)? = null
 
     /** 注册时的 WiFi SSID：换网（2.4G→5G 或车机热点切换）后旧注册不可见，需重新注册。 */
     private var registeredSsid: String? = null
@@ -371,6 +372,17 @@ class CarPlayCtrlAdvertiser(
                         }?.substringAfter(':')
                         ?.trim()
                 inviteCount++
+                val localHost = client.localAddress.hostAddress ?: ""
+                val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                val receivingNetwork = connectivity?.allNetworks?.firstOrNull { network ->
+                    connectivity.getLinkProperties(network)?.linkAddresses?.any {
+                        it.address == client.localAddress
+                    } == true
+                }
+                val invitation = CarPlayInvitationGate.Invitation(
+                    invitationSerial.incrementAndGet(), receiverId, peer, localHost,
+                    receivingNetwork?.networkHandle, SystemClock.uptimeMillis(),
+                )
                 // 来源地址即车机 IP：记下来当端点候选（mDNS 失效时它是唯一活证据）。
                 // 占位值（0.0.0.0 / 127.x）不采信，那是本机网络栈自己，不是车机。
                 if (!EndpointHosts.isPlaceholder(peer)) {
@@ -379,7 +391,7 @@ class CarPlayCtrlAdvertiser(
                 }
                 log("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次，receiver=${receiverId ?: "?"}）——AirPlay 窗口已开启")
                 // 回调里可能再走一轮连接（会话失败后的恢复入口），异常不能打死应答
-                runCatching { onInvite?.invoke(receiverId) }
+                runCatching { onInvite?.invoke(invitation) }
                     ?.onFailure { log("$TAG: 邀请回调异常 - ${it.message ?: it.javaClass.simpleName}") }
             }
 

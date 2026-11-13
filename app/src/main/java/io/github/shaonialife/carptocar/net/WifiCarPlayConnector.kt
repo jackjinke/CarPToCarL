@@ -69,9 +69,40 @@ class WifiCarPlayConnector(
         context.applicationContext.getSystemService(WifiManager::class.java)
 
     private val callback = AtomicReference<ConnectivityManager.NetworkCallback?>(null)
+    // Protected by this monitor; passive probing must not cancel an unfinished requestNetwork.
+    private var networkRequestPending = false
 
     val currentNetwork: Network? get() = boundNetwork.get()
     private val boundNetwork = AtomicReference<Network?>(null)
+    private var lastInvalidNetwork: Network? = null
+
+    /**
+     * Read-only reuse check: never adopts another WiFi or releases an in-flight request.
+     * Like adoption, either address family is sufficient; car hotspots need no Internet.
+     */
+    @Synchronized
+    fun currentUsableNetwork(): Network? {
+        val network = boundNetwork.get() ?: return null
+        val usable =
+            try {
+                callback.get() != null &&
+                    connectivityManager.boundNetworkForProcess == network &&
+                    connectivityManager.getNetworkCapabilities(network)
+                        ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                    linkReady(network)
+            } catch (_: Exception) {
+                false
+            }
+        if (usable) {
+            lastInvalidNetwork = null
+            return network
+        }
+        if (lastInvalidNetwork != network) {
+            lastInvalidNetwork = network
+            log("WiFi: 不复用失效缓存 network=$network（绑定归属或框架 WiFi/地址状态已失效）")
+        }
+        return null
+    }
 
     /**
      * 用 [adoptAssociated] 直接绑上去的那条网络，以及为它挂的「只看断线」回调。
@@ -87,7 +118,7 @@ class WifiCarPlayConnector(
      * 空实现 = 不关心（例如手动绑定路径）。
      */
     @Volatile
-    var onNetworkLost: ((ssid: String) -> Unit)? = null
+    var onNetworkLost: ((ssid: String, isCurrentLoss: () -> Boolean) -> Unit)? = null
 
     /**
      * 当前绑定网络的**全部**默认网关（车机热点场景 = 车机 IP），**IPv4 排在最前**。
@@ -112,8 +143,7 @@ class WifiCarPlayConnector(
                     ?.routes
                     .orEmpty()
                     .filter { it.isDefaultRoute }
-                    .mapNotNull { it.gateway?.hostAddress?.substringBefore('%') }
-                    .distinct()
+                    .mapNotNull { it.gateway?.hostAddress }
             } catch (_: Exception) {
                 return emptyList()
             }
@@ -128,7 +158,7 @@ class WifiCarPlayConnector(
                     "（不是车机地址，热点 DHCP 没下发真实网关）",
             )
         }
-        return usable.filter { it.contains('.') } + usable.filter { !it.contains('.') }
+        return EndpointHosts.candidates(usable)
     }
 
     /** [gatewayAddresses] 的首选（IPv4 优先）。 */
@@ -202,7 +232,6 @@ class WifiCarPlayConnector(
         val specifier =
             buildSpecifier(ssid, passphrase, securityType)
                 ?: return JoinResult.Unsupported
-        release()
         val request =
             NetworkRequest
                 .Builder()
@@ -212,41 +241,56 @@ class WifiCarPlayConnector(
         val latch = CountDownLatch(1)
         val result = AtomicReference<Network?>(null)
         val unavailable = AtomicBoolean(false)
+        val bindingFailed = AtomicBoolean(false)
         val newCallback =
             object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    val bound = connectivityManager.bindProcessToNetwork(network)
-                    boundNetwork.set(network)
-                    result.set(network)
-                    log("WiFi: 已加入应用专属网络 \"$ssid\"（$network bindProcessToNetwork=$bound）——不影响其它应用联网")
-                    latch.countDown()
+                    synchronized(this@WifiCarPlayConnector) {
+                        if (callback.get() !== this || isCancelled()) return
+                        networkRequestPending = false
+                        val bound = connectivityManager.bindProcessToNetwork(network)
+                        if (bound) {
+                            boundNetwork.set(network)
+                            result.set(network)
+                            log("WiFi: 已加入应用专属网络 \"$ssid\"（$network bindProcessToNetwork=true）")
+                        } else {
+                            bindingFailed.set(true)
+                            unavailable.set(true)
+                            log("WiFi: \"$ssid\" 已关联，但进程网络绑定被拒绝（network=$network）")
+                        }
+                        latch.countDown()
+                    }
                 }
 
                 override fun onUnavailable() {
-                    unavailable.set(true)
-                    log("WiFi: 系统未允许加入 \"$ssid\"（用户拒绝或热点不在范围内）")
-                    latch.countDown()
+                    synchronized(this@WifiCarPlayConnector) {
+                        if (callback.get() !== this || isCancelled()) return
+                        networkRequestPending = false
+                        unavailable.set(true)
+                        log("WiFi: 系统未允许加入 \"$ssid\"（用户拒绝或热点不在范围内）")
+                        latch.countDown()
+                    }
                 }
 
                 override fun onLost(network: Network) {
-                    if (boundNetwork.compareAndSet(network, null)) {
-                        connectivityManager.bindProcessToNetwork(null)
-                        log("WiFi: 应用专属网络 \"$ssid\" 已断开（$network）")
-                        onNetworkLost?.invoke(ssid)
-                    }
+                    handleNetworkLost(this, network, "应用专属网络 \"$ssid\"", ssid)
                 }
             }
-        callback.set(newCallback)
         val accepted =
             try {
-                connectivityManager.requestNetwork(request, newCallback)
-                true
+                synchronized(this) {
+                    release()
+                    callback.set(newCallback)
+                    networkRequestPending = true
+                    connectivityManager.requestNetwork(request, newCallback)
+                    true
+                }
             } catch (error: Exception) {
                 log("WiFi: 发起应用专属网络请求失败（${error.message}）——可能需要位置权限或系统不支持")
                 false
             }
         if (!accepted) {
-            release()
+            releaseIfOwned(newCallback)
             return JoinResult.Unavailable
         }
         val deadline = SystemClock.uptimeMillis() + timeoutMillis
@@ -261,7 +305,7 @@ class WifiCarPlayConnector(
             state = awaitJoin(latch, SystemClock.uptimeMillis() + graceMillis, isCancelled)
         }
         if (state < 0) {
-            release()
+            releaseIfOwned(newCallback)
             return JoinResult.Unavailable
         }
         val network = result.get()
@@ -273,12 +317,22 @@ class WifiCarPlayConnector(
                     "${timeoutMillis / 1000}s"
                 }
             val why =
-                if (unavailable.get()) "——系统已判定不可用" else "——系统确认框可能仍在前台"
-            log("WiFi: 等待加入 \"$ssid\" 超时（$window）$why")
-            release()
+                when {
+                    bindingFailed.get() -> "进程网络绑定被拒绝"
+                    unavailable.get() -> "系统已判定不可用"
+                    else -> "等待超时（$window）"
+                }
+            log("WiFi: 加入 \"$ssid\" 未完成：$why")
+            releaseIfOwned(newCallback)
             return JoinResult.Unavailable
         }
-        return JoinResult.Joined(network)
+        return synchronized(this) {
+            if (callback.get() === newCallback && boundNetwork.get() == network) {
+                JoinResult.Joined(network)
+            } else {
+                JoinResult.Unavailable
+            }
+        }
     }
 
     /**
@@ -347,7 +401,6 @@ class WifiCarPlayConnector(
      * （请求保持挂起，用户加入热点后仍会自动完成绑定并回调）。
      */
     fun bindCurrentWifi(onResult: (Boolean) -> Unit = {}) {
-        release()
         val request =
             NetworkRequest
                 .Builder()
@@ -361,25 +414,40 @@ class WifiCarPlayConnector(
         val newCallback =
             object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    boundNetwork.set(network)
-                    val bound = connectivityManager.bindProcessToNetwork(network)
-                    log("WiFi: 已绑定当前WiFi网络 $network bindProcessToNetwork=$bound")
-                    if (reported.compareAndSet(false, true)) onResult(true)
+                    synchronized(this@WifiCarPlayConnector) {
+                        if (callback.get() !== this) return
+                        networkRequestPending = false
+                        val bound = connectivityManager.bindProcessToNetwork(network)
+                        if (bound) boundNetwork.set(network)
+                        log("WiFi: 当前WiFi网络 $network bindProcessToNetwork=$bound")
+                        if (reported.compareAndSet(false, true)) onResult(bound)
+                    }
                 }
 
                 override fun onUnavailable() {
-                    log("WiFi: 没有可用的WiFi连接——请先在系统设置里加入接收端热点")
-                    if (reported.compareAndSet(false, true)) onResult(false)
+                    synchronized(this@WifiCarPlayConnector) {
+                        if (callback.get() !== this) return
+                        networkRequestPending = false
+                        log("WiFi: 没有可用的WiFi连接——请先在系统设置里加入接收端热点")
+                        if (reported.compareAndSet(false, true)) onResult(false)
+                    }
                 }
 
                 override fun onLost(network: Network) {
-                    if (boundNetwork.compareAndSet(network, null)) {
-                        log("WiFi: 绑定的 WiFi 网络已断开（$network）")
-                    }
+                    handleNetworkLost(this, network, "绑定的 WiFi 网络")
                 }
             }
-        callback.set(newCallback)
-        connectivityManager.requestNetwork(request, newCallback)
+        synchronized(this) {
+            release()
+            callback.set(newCallback)
+            networkRequestPending = true
+            try {
+                connectivityManager.requestNetwork(request, newCallback)
+            } catch (error: Exception) {
+                releaseIfOwned(newCallback)
+                throw error
+            }
+        }
         // 提示性看门狗（**不决定成败**）：requestNetwork 在「手机尚未连上 WiFi」时
         // 会一直挂起，等系统关联+DCHP 完成才回调 onAvailable——实测用户手动加入
         // 热点时可达 10s+。这里只在 5s 时给用户一句指引，超时判定由调用方的
@@ -390,7 +458,7 @@ class WifiCarPlayConnector(
             } catch (_: InterruptedException) {
                 return@run
             }
-            if (!reported.get()) {
+            if (callback.get() === newCallback && !reported.get()) {
                 log("WiFi: 5 秒尚未绑定（手机可能还没连上热点）——请到 设置>WLAN 加入接收端热点，加入后本轮绑定会自动完成")
             }
         }
@@ -571,6 +639,7 @@ class WifiCarPlayConnector(
      *
      * @return 绑定成功返回那条网络；没连在该热点上 / 绑定被系统拒绝返回 null
      */
+    @Synchronized
     fun adoptAssociated(ssid: String): Network? {
         val network = findAssociatedNetwork(ssid) ?: return null
         // 关联上了不等于能用：DHCP 还没回来的那一瞬网络已经出现在列表里，但没有任何
@@ -605,8 +674,9 @@ class WifiCarPlayConnector(
      * 不在这里 `requestNetwork`：那会按「任意 WiFi」泛匹配，`onAvailable` 可能给到
      * 家里那条；这里只关心 `onLost`，所以用 `registerNetworkCallback` 纯监听。
      */
+    @Synchronized
     private fun watchLoss(
-        ssid: String,
+        ssid: String?,
         network: Network,
     ) {
         if (watchedNetwork.get() == network && callback.get() != null) return
@@ -614,11 +684,7 @@ class WifiCarPlayConnector(
         val watcher =
             object : ConnectivityManager.NetworkCallback() {
                 override fun onLost(lost: Network) {
-                    if (!boundNetwork.compareAndSet(lost, null)) return
-                    watchedNetwork.compareAndSet(lost, null)
-                    connectivityManager.bindProcessToNetwork(null)
-                    log("WiFi: 车机热点 \"$ssid\" 已断开（$lost）")
-                    onNetworkLost?.invoke(ssid)
+                    handleNetworkLost(this, lost, ssid?.let { "车机热点 \"$it\"" } ?: "当前 WiFi", ssid)
                 }
             }
         val request =
@@ -626,6 +692,8 @@ class WifiCarPlayConnector(
                 .Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                 .build()
+        callback.set(watcher)
+        watchedNetwork.set(network)
         val ok =
             try {
                 connectivityManager.registerNetworkCallback(request, watcher)
@@ -634,9 +702,10 @@ class WifiCarPlayConnector(
                 log("WiFi: 挂断线监听失败（${error.message}）——热点断开将感知不到")
                 false
             }
-        if (!ok) return
-        callback.set(watcher)
-        watchedNetwork.set(network)
+        if (!ok) {
+            callback.compareAndSet(watcher, null)
+            watchedNetwork.set(null)
+        }
     }
 
     /**
@@ -739,15 +808,14 @@ class WifiCarPlayConnector(
      * 挑选顺序：已绑定且仍可用 → `wlan0` 那条 → 任意 TRANSPORT_WIFI 且拿到地址的。
      * 只认「已拿到地址」的网络：DHCP 没回来时绑上去建 socket 必然失败。
      *
-     * 不挂 [watchLoss]：调用方（保活轮询）每 5s 会重新调一次，断了自然会拿到 null 或
-     * 换一条新网络；挂上去反而要用一个假 SSID 去触发 [onNetworkLost] 的重绑流程。
+     * 挂只读断线监听以清除失效绑定；SSID 未知时不触发热点自动重绑。
      *
      * @return 已绑定的网络；手机没挂任何 WiFi 时返回 null
      */
+    @Synchronized
     fun adoptCurrentWifi(): Network? {
-        boundNetwork.get()?.let { current ->
-            if (linkReady(current)) return current
-        }
+        currentUsableNetwork()?.let { return it }
+        if (networkRequestPending) return null
         val candidates =
             try {
                 connectivityManager.allNetworks.filter { network ->
@@ -768,6 +836,7 @@ class WifiCarPlayConnector(
         return try {
             if (!connectivityManager.bindProcessToNetwork(picked)) return null
             boundNetwork.set(picked)
+            watchLoss(null, picked)
             picked
         } catch (_: Exception) {
             null
@@ -786,6 +855,9 @@ class WifiCarPlayConnector(
     fun networkSnapshot(expectedSsid: String?): CarNetworkSnapshot {
         val bound = boundNetwork.get()
         val boundCaps = bound?.let { runCatching { connectivityManager.getNetworkCapabilities(it) }.getOrNull() }
+        val ownsBinding = bound != null && callback.get() != null &&
+            connectivityManager.boundNetworkForProcess == bound &&
+            boundCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
         val boundSsid = plainSsid((boundCaps?.transportInfo as? WifiInfo)?.ssid)
         // 按 SSID 精确找「系统已关联在目标热点上的那条」：读不到 SSID 时它一定返回 null，
         // 这时不猜（猜错会把进程绑到家里的 WiFi 上）。
@@ -801,8 +873,8 @@ class WifiCarPlayConnector(
             expectedSsid = expectedSsid,
             boundSsid = boundSsid,
             associatedSsid = associatedSsid,
-            hasBoundNetwork = bound != null,
-            hasAddress = bound != null && linkReady(bound),
+            hasBoundNetwork = ownsBinding,
+            hasAddress = ownsBinding && bound != null && linkReady(bound),
             associatedReady = associated != null && linkReady(associated),
             localIpv4 =
                 link?.linkAddresses
@@ -827,12 +899,54 @@ class WifiCarPlayConnector(
         return plainSsid(info.ssid)
     }
 
+    /**
+     * Network callbacks can parcel an equal but distinct Network object. CAS must use the
+     * stored reference; the monitor also serializes process binding with release/adoption.
+     */
+    private fun handleNetworkLost(
+        owner: ConnectivityManager.NetworkCallback,
+        lost: Network,
+        description: String,
+        ssid: String? = null,
+    ) {
+        synchronized(this) {
+            val stored = boundNetwork.get() ?: return
+            if (callback.get() !== owner || stored != lost) {
+                log("WiFi: 忽略过期 onLost network=$lost current=$stored callbackOwner=${callback.get() === owner}")
+                return
+            }
+            if (!boundNetwork.compareAndSet(stored, null)) return
+            val watched = watchedNetwork.get()
+            if (watched == lost) watchedNetwork.compareAndSet(watched, null)
+            val processBound = connectivityManager.boundNetworkForProcess
+            val unbindOwned = processBound == stored
+            if (unbindOwned) connectivityManager.bindProcessToNetwork(null)
+            log(
+                "WiFi: $description 已断开（$lost valueMatch=true sameInstance=${stored === lost}" +
+                    " callbackOwner=true processBound=$processBound unbind=$unbindOwned）",
+            )
+        }
+        // Session callbacks acquire their lifecycle lock; never invoke them under this monitor.
+        if (ssid != null) onNetworkLost?.invoke(ssid) {
+            synchronized(this) { callback.get() === owner && boundNetwork.get() == null }
+        }
+    }
+
+    @Synchronized
+    private fun releaseIfOwned(owner: ConnectivityManager.NetworkCallback) {
+        if (callback.get() === owner) release()
+    }
+
+    @Synchronized
     fun release() {
+        networkRequestPending = false
         callback.getAndSet(null)?.let {
             runCatching { connectivityManager.unregisterNetworkCallback(it) }
         }
         watchedNetwork.set(null)
-        if (boundNetwork.getAndSet(null) != null) {
+        val network = boundNetwork.getAndSet(null)
+        lastInvalidNetwork = null
+        if (network != null && connectivityManager.boundNetworkForProcess == network) {
             connectivityManager.bindProcessToNetwork(null)
         }
     }

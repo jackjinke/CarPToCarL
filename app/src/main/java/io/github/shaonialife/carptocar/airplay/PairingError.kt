@@ -65,6 +65,9 @@ class PairingRejectedException(
     val deterministic: Boolean get() = PairingPolicy.isDeterministic(stage, code)
 }
 
+/** A failed cryptographic proof is not a receiver capability or an already-paired response. */
+class PairingIntegrityException(message: String) : IOException(message)
+
 /** 一轮配对失败的定性结果，用于日志与界面提示。 */
 data class PairingTrouble(
     val stage: PairingStage,
@@ -134,13 +137,13 @@ object PairingPolicy {
         when {
             code == PairingErrorCode.AUTHENTICATION && stage == PairingStage.PAIR_VERIFY ->
                 "车机不认这台手机的配对身份：到车机「已连接设备/手机列表」里删掉本机再重连，" +
-                    "或在本机「断开」后重新配对。在此之前只能用明文会话（无音频、无触摸）"
+                    "或在本机「断开」后重新配对。本轮保留认证失败状态，下次连接重新认证"
             code == PairingErrorCode.AUTHENTICATION ->
                 "车机拒绝了本次配对：先试「已配对设备」快路径；仍失败就去车机侧删掉本机的配对记录"
             code == PairingErrorCode.MAX_PEERS ->
                 "车机保存的设备已达上限：到车机上删掉一台旧设备后重连"
             code == PairingErrorCode.MAX_TRIES ->
-                "车机的配对尝试次数已用尽：等它自己解除（通常几分钟），期间可继续用明文会话"
+                "车机的配对尝试次数已用尽：等它自己解除（通常几分钟）后重新连接"
             code == PairingErrorCode.BACKOFF || code == PairingErrorCode.BUSY ->
                 "车机暂时不接受配对：已按退避重试，无需操作"
             else ->

@@ -111,7 +111,7 @@ internal object CarLifeProtocol {
      * 一次都没出现）。我们没有任何密钥协商实现，收到之后引擎约 20 秒（实测 18.07s 起算于
      * 98311、20.1s 起算于建链）就把四条通道全部拆掉并重启会话——
      * 表现正是「CarLife 一直在重启」，同时媒体音频一个字节都不推（只有我们补的静音帧）。
-     * 所以默认**不再下发** `CONTENT_ENCRYPTION`，这行日志留着当判据。
+     * 所以固定下发 `CONTENT_ENCRYPTION=0`，这行日志留着当判据。
      */
     const val MD_ENCRYPT_SETUP = 65642
 
@@ -227,14 +227,14 @@ internal object CarLifeProtocol {
     // 包类型来自 AudioUtil.EMusicPackageType：INIT=0x30001（负载是 CarlifeMusicInit
     // 原型，宣告采样率/声道/位深），NORMAL=0x30006（负载是裸 PCM）。
     //
-    // 0x30002 / 0x30003 是**长度 0 的开停信号**（2026-10-26 从真机日志反推，见 docs/audio-call-issues.md）：
-    //   0x30002 出现后立刻来首帧 PCM（10:03:16、10:24:19 两次）；
-    //   0x30003 出现后引擎音频归零（10:21:13、10:31:50 两次，均为来电期间）。
-    // 语义按「开始 / 停止」处理，再往上叠一层兜底（停止后仍收 PCM 照常转发，不靠它裁决）。
+    // 手机端 CommonParams / PCMMediaManager 与 Vehicle Lib 一致：
+    // STOP=0x30002、PAUSE=0x30003、RESUME_PLAY=0x30004。
+    // 格式 INIT 或普通 PCM 不代表新的播放意图，不能据此抢占车机音源。
     const val AUDIO_HEAD_LEN = 12
     const val MUSIC_PKG_INIT = 0x30001
-    const val MUSIC_PKG_START = 0x30002
-    const val MUSIC_PKG_STOP = 0x30003
+    const val MUSIC_PKG_STOP = 0x30002
+    const val MUSIC_PKG_PAUSE = 0x30003
+    const val MUSIC_PKG_RESUME = 0x30004
     const val MUSIC_PKG_NORMAL = 0x30006
 
     // ---- TTS（9241 端口）：导航播报 / 语音提示 ----
@@ -242,12 +242,14 @@ internal object CarLifeProtocol {
     // 关键：**这条通道才是导航声音的来源**，与媒体通道（9240 / 0x3xxxx）完全独立。
     // 2026-10-27 真机日志（WinPlay 测试台）实测：
     //   0x40001 长度 7    → 格式宣告（CarlifeMusicInit 同构）
-    //   0x40002 长度 0    → 开始
+    //   0x40002 长度 0    → 停止（CarLife Vehicle Lib MSG_TTS_STOP）
     //   0x40003 长度 1280 → **裸 PCM（导航播报数据）**
     // 编号与媒体通道**不对应**（媒体数据包是 0x30006，TTS 却在 0x40003 上带负载），
     // 所以这里不照搬编号做枚举，只认两条铁律：**有负载就是 PCM，长度 0 就是开停信号**。
     // 旧实现把 0x4xxxx 全丢进「暂不处理」，症状正是「音乐有声、地图导航没声」。
     const val TTS_PKG_INIT = 0x40001
+    const val TTS_PKG_STOP = 0x40002
+    const val TTS_PKG_NORMAL = 0x40003
 
     /** TTS 未宣告格式时的兜底采样率（导航播报常见 16k 单声道，AudioSender 会重采样到 48k）。 */
     const val TTS_DEFAULT_RATE = 16_000
@@ -364,24 +366,22 @@ internal object CarLifeProtocol {
      *  - `MEDIA_LYRIC_SUPPORT = 1` → 引擎 dispatch `carlife_other_media_lyric_support`，
      *    开启歌词支持。
      *
-     * 2026-11-08 曾补 `CONTENT_ENCRYPTION = 1`（参考 OcarPlay 的同一份清单）。**2026-11-11 撤回**：
-     * 带上它以后引擎立刻发 65642（见 [MD_ENCRYPT_SETUP]）要 RSA/AES 密钥，我们不应答 →
-     * 约 20 秒后整条会话被引擎拆掉、CarLife+ 重启，且媒体音频再也不推 PCM。
-     * 同一台荣耀机 2026-10-26（不带该项）连续放音 6 分钟，媒体音频格式、PCM 都正常，
-     * 所以这是一条可 A/B 的单变量：默认关，需要时再显式打开。
+     * CONTENT_ENCRYPTION 必须声明 0：当前客户端只实现明文 CarLife。
+     * 2026-11-11 撤回值 1：引擎收到后立刻发 65642（见 [MD_ENCRYPT_SETUP]）要求
+     * RSA/AES 密钥协商；未完成握手时，约 20 秒后整条会话被拆掉，媒体音频也不推 PCM。
+     * AirPlay 侧的加密与此能力无关。
      */
     fun featureConfig(
         connectType: Int = CONNECT_TYPE_WIFI,
         iFrameInterval: Int = I_FRAME_INTERVAL_DEFAULT,
         useVehicleResolution: Boolean = true,
         mediaLyricSupport: Boolean = true,
-        contentEncryption: Boolean = false,
     ): ByteArray {
         val items = ArrayList<ByteArray>()
         items += pbString(1, "I_FRAME_INTERVAL") + pbVarint(2, iFrameInterval)
         items += pbString(1, "CONNECT_TYPE") + pbVarint(2, connectType)
         items += pbString(1, "DISABLE_RESOLUTION_OPTION") + pbVarint(2, if (useVehicleResolution) 1 else 0)
-        items += pbString(1, "CONTENT_ENCRYPTION") + pbVarint(2, if (contentEncryption) 1 else 0)
+        items += pbString(1, "CONTENT_ENCRYPTION") + pbVarint(2, 0)
         items += pbString(1, "MEDIA_LYRIC_SUPPORT") + pbVarint(2, if (mediaLyricSupport) 1 else 0)
         var list = ByteArray(0)
         for (item in items) list += pbBytes(2, item)
