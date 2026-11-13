@@ -35,11 +35,9 @@
 
 | 改动 | 位置 |
 | --- | --- |
-| 引擎报 `0x30003` 时**立即**补静音（阈值 300ms → 0） | `AudioSender.beginIdleFill()` |
-| 引擎报 `0x30002` 时恢复阈值 | `AudioSender.endIdleFill()` |
-| 只有停 ≥ 2s 才补发同步包重对齐（短中断靠静音帧续时间戳，不重对齐） | `CarLifeHijack.onEngineAudioGate()` |
-| 单拍补帧上限 12 → 16（100ms 一拍需要 13.6 帧，12 会让补帧永远慢一拍） | `MAX_KEEPALIVE_FRAMES_PER_TICK` |
-
+| `RECORD` 激活后由单一输出时钟匀速渲染 RTP 音频包（无样本时自动输出静音帧） | `AudioSender.onRecorded()` / `CarLifePcmMixer` |
+| 媒体（9240）与导航 TTS（9241）独立队列、采样点级混音 + TTS 压低媒体增益 | `CarLifePcmMixer.render()` |
+| 关联模块焦点与 `0x30002`（STOP）/ `0x30003`（PAUSE）/ `0x30004`（RESUME）状态机 | `CarLifeMediaPlayback` |
 效果：311ms 内的 RTP 时间戳保持连续，车机缓冲不排空 → 用户听到的是「静音 0.3 秒」，
 但不再有恢复瞬间的那一下卡顿。**提示音本身在车机上仍然听不到**——它由手机播放，
 不走 CarLife 的媒体/TTS 通道，我们无从捕获（要听得见，得靠 CarLife 自己的「消息播报」
