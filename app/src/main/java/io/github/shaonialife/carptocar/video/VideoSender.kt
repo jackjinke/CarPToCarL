@@ -80,6 +80,7 @@ class VideoSender(
      * 少写一个字段就少一处与车机固件理解不一致的风险。
      */
     private val viewAreaSize: (() -> Pair<Int, Int>)? = null,
+    private val clockMillis: () -> Long = { defaultMonotonicMillis() },
 ) {
     private val width: Int = (width / 2) * 2
     private val height: Int = (height / 2) * 2
@@ -158,6 +159,10 @@ class VideoSender(
      */
     @Volatile
     private var configSent = false
+
+    /** 源重启后待在下一帧新 IDR 前补发 VideoConfig；期间保持 [configSent] 为 true 以放行旧 IDR 保活。 */
+    @Volatile
+    private var configRefreshPending = false
 
     @Volatile
     private var passthrough = false
@@ -370,6 +375,7 @@ class VideoSender(
                 }
             synchronized(writeLock) {
                 configSent = false
+                configRefreshPending = false
                 frameCounter = 0L
                 lastIdrNals = null
                 // 新通道 = 接收端重建解密与解码状态：同样要等一个 IDR 再喂帧。
@@ -584,7 +590,7 @@ class VideoSender(
         cachedCsd = null
         sentSps = null
         configSent = false
-        // **必须等 IDR**（2026-11-03 ID7 实测）：此前这里是 false，配合下面 attach() 后
+        configRefreshPending = false
         // `seedCsd()` 预置的 cachedCsd，submitH264 会走「用缓存 csd 重发 VideoConfig」
         // 分支把**当前这一帧 P 帧当成新流的首帧**发出去。车机解码器刚重建、一帧参考都没有，
         // 收到 P 帧直接拆整轮会话：15 次断流里有 8 次是「首帧 NAL=1 → 0.1~0.2 秒被 reset」，
@@ -652,19 +658,25 @@ class VideoSender(
         lastIdleResendAt = now
         suppressFrameLog = true
         try {
-            sendFrameFromNals(nals, true, output)
-            idleResendCount++
-            if (idleResendCount == 1L || idleResendCount % 30L == 0L) {
-                log(
-                    "VIDEO: 已 ${(now - lastFrameAtMs) / 1000}s 没有新画面——重发最后一个 IDR " +
-                        "维持车机连接（第 $idleResendCount 次）",
-                )
+            if (sendFrameFromNals(nals, keyFrame = true, output = output, idleResend = true)) {
+                idleResendCount++
+                if (idleResendCount == 1L || idleResendCount % 30L == 0L) {
+                    log(
+                        "VIDEO: 已 ${(now - lastFrameAtMs) / 1000}s 没有新画面——重发最后一个 IDR " +
+                            "维持车机连接（第 $idleResendCount 次）",
+                    )
+                }
             }
         } catch (error: Exception) {
             log("VIDEO: 空闲保活重发失败 - ${error.message}")
         } finally {
             suppressFrameLog = false
         }
+    }
+
+    internal fun resendIdleFrameForTest() {
+        val out = socket?.getOutputStream() ?: return
+        maybeResendIdleFrame(out)
     }
 
     /**
@@ -691,13 +703,13 @@ class VideoSender(
      */
     fun onSourceRestart(reason: String) {
         if (!running.get()) return
-        configSent = false
+        // 标记「下一帧新 IDR 到来前必须重发 VideoConfig」，但不要在此刻把 configSent 清成 false：
+        // 若车机解码器已吃过上一份 avcC 且手里还有配套的 lastIdrNals，源重建空窗期仍靠旧 IDR 保活，
+        // 否则 sendFrameFromNals 会以「config 尚未发送」把所有保活帧拦掉，30 秒零帧即被车机拆链。
+        configRefreshPending = true
         beginAwaitingKeyFrame()
-        // 不在这里清 lastIdrNals：源重启到新源出首帧之间可能有几秒空窗，
-        // 旧 IDR 还能继续喂保活，避免车机因「视频静默」拆掉整轮会话。
-        // 一旦真的发出新 config，sendConfigFromNals 会立刻把它作废。
         lastFrameAtMs = monotonicMillis()
-        log("VIDEO: 检测到 CarLife 源重启（$reason）——重置配置、等待新 IDR（帧计数保持，nonce 不复用）")
+        log("VIDEO: 检测到 CarLife 源重启（$reason）——等待新 IDR 刷新配置（保活继续，帧计数保持）")
     }
 
     /**
@@ -792,20 +804,25 @@ class VideoSender(
                     )
                 }
             }
+            if (hasSps && isIdr) {
+                // CarLife 只在编码器（重）初始化后的首帧 IDR 携带 SPS；此时 PTS 起点可能重置。
+                deliveryGate.onCodecReinit()
+            }
             // 会话中途 SPS 变了（用户在车联里改分辨率 / 引擎重建编码器）：
             // 车机手里的 avcC 已经不对，必须重发一份新的。
             if (configSent && hasSps && !spsMatchesSent(nalUnits)) {
                 log("VIDEO: 检测到 SPS 变化——重发 VideoConfig（分辨率/档位已变）")
-                configSent = false
+                configRefreshPending = true
             }
-            if (!configSent && diagRejects < 3) {
+            val needConfig = !configSent || configRefreshPending
+            if (needConfig && diagRejects < 3) {
                 diagRejects++
                 log(
                     "VIDEO: 等 SPS 中——本帧 NAL 类型=" +
                         nalUnits.joinToString(",") { "${it[0].toInt() and 0x1F}" } + " hasSps=$hasSps",
                 )
             }
-            if (!configSent) {
+            if (needConfig) {
                 if (hasSps) {
                     sendConfigFromNals(nalUnits, output, "当期帧自带SPS")
                 } else {
@@ -1033,9 +1050,6 @@ class VideoSender(
         // 记住这份 csd：源重启后新 IDR 若不带 SPS/PPS，靠它兜底重发 config。
         cachedCsd = listOf(sps, pps)
         sentSps = sps.copyOf()
-        // 换参数后旧 IDR 与新车机 avcC 不再匹配，不能再用它做空闲重发。
-        lastIdrNals = null
-        // 显式画布覆盖只用于 CAR 实验档；RAW/SPLIT 默认跟随本份 avcC 的裁剪后 SPS 尺寸，
         // 不依赖源侧异步尺寸回调，使缓存 GOP 回放与实时帧声明始终与同代 SPS 一致。
         val canvas = canvasSize?.invoke()
         val live = liveSize?.invoke()
@@ -1084,11 +1098,14 @@ class VideoSender(
         val viewArea = viewAreaSize?.invoke()?.takeIf { it.first > 0 && it.second > 0 }
         val header = buildVideoConfigHeader(body.size, cfgWidth, cfgHeight, viewArea)
         synchronized(writeLock) {
+            // 换参数后旧 IDR 与新车机 avcC 不再匹配，与写新 config 原子更新，防止保活线程插队发出旧 IDR。
+            lastIdrNals = null
             // config 帧是明文，但同样不能插在别的帧中间（否则接收端按半帧解析）。
             output.write(header)
             output.write(body)
             output.flush()
             configSent = true
+            configRefreshPending = false
         }
         log(
             "VIDEO: ✓ VideoConfig 已发送 avcC=${body.size}B（SPS ${sps.size}B/PPS ${pps.size}B，" +
@@ -1115,12 +1132,13 @@ class VideoSender(
         nalUnits: List<ByteArray>,
         keyFrame: Boolean,
         output: java.io.OutputStream,
-    ) {
+        idleResend: Boolean = false,
+    ): Boolean {
         if (!configSent) {
             log("VIDEO: 丢弃一帧（config 尚未发送）")
-            return
+            return false
         }
-        if (nalUnits.isEmpty()) return
+        if (nalUnits.isEmpty()) return false
         val size = nalUnits.sumOf { it.size + 4 }
 
         val packed = ByteArrayOutputStream(size)
@@ -1146,6 +1164,7 @@ class VideoSender(
         writeStartedAt = monotonicMillis()
         try {
             synchronized(writeLock) {
+                if (!configSent || (idleResend && lastIdrNals !== nalUnits)) return false
                 val header =
                     buildHeader(
                         OP_FRAME,
@@ -1175,6 +1194,7 @@ class VideoSender(
         if (!suppressFrameLog && (keyFrame || framesSent <= 3 || framesSent % 150 == 0L)) {
             log("VIDEO: 帧 #$framesSent ${plain.size}B${if (keyFrame) " (key)" else ""} 已发送")
         }
+        return true
     }
 
     /** 128 字节消息头：u32LE body 长度、opcode、NTP 32.32 LE 时间戳，其余为零。 */
@@ -1245,6 +1265,8 @@ class VideoSender(
         return units
     }
 
+    private fun monotonicMillis(): Long = clockMillis()
+
     companion object {
         private const val HEADER_LEN = 128
         private const val OP_FRAME = 0
@@ -1254,7 +1276,7 @@ class VideoSender(
         private const val TAG_SIZE = 16
         private val CLOCK_ORIGIN_NANOS = System.nanoTime()
 
-        private fun monotonicMillis(): Long = ((System.nanoTime() - CLOCK_ORIGIN_NANOS) / 1_000_000L) + 1L
+        private fun defaultMonotonicMillis(): Long = ((System.nanoTime() - CLOCK_ORIGIN_NANOS) / 1_000_000L) + 1L
 
         /** 视频通道被重置后的重连尝试次数（接收端只等 8s，2s 超时 × 3 次刚好留余量）。 */
         private const val DATA_RECONNECT_ATTEMPTS = 3
