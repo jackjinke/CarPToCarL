@@ -22,9 +22,9 @@ import io.github.shaonialife.carptocar.bt.Iap2BluetoothServer
 import io.github.shaonialife.carptocar.bt.TargetDevicePrefs
 import io.github.shaonialife.carptocar.capture.HiddenDisplaySource
 import io.github.shaonialife.carptocar.carlife.CarGpsFix
+import io.github.shaonialife.carptocar.carlife.CarGpsOption
 import io.github.shaonialife.carptocar.carlife.CarLifeHijack
 import io.github.shaonialife.carptocar.carlife.CarLifeProtocol
-import io.github.shaonialife.carptocar.carlife.CarGpsOption
 import io.github.shaonialife.carptocar.carlife.VoiceKeyRouter
 import io.github.shaonialife.carptocar.iap2.AccessoryDeclaration
 import io.github.shaonialife.carptocar.iap2.CarPlayNowPlaying
@@ -667,6 +667,9 @@ object SessionController {
         if (action >= 0 && MediaSessionsState.dispatchTransport(action)) {
             return
         }
+        if (CarLifeHijack.sendMediaKey(keyCode)) {
+            return
+        }
         // 回退：无活跃会话 / 动作不受支持时走系统焦点路由
         val ctx = appContext ?: return
         val audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
@@ -696,7 +699,8 @@ object SessionController {
             java.util.concurrent.TimeUnit.MILLISECONDS,
             java.util.concurrent.ArrayBlockingQueue(2),
             { runnable -> Thread(runnable, "carlife-cmd").apply { isDaemon = true } },
-            java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy(),
+            java.util.concurrent.ThreadPoolExecutor
+                .DiscardOldestPolicy(),
         )
 
     /**
@@ -1459,7 +1463,9 @@ object SessionController {
     }
 
     /** 音频配置守卫是否在跑（一轮 connect 只拉一条线程）。 */
-    private val audioGuardRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val audioGuardRunning =
+        java.util.concurrent.atomic
+            .AtomicBoolean(false)
 
     /**
      * 音频配置守卫：会话期间**持续**断开目标车机的 HFP/A2DP（2026-11-08 按宝马 fork 移植）。
@@ -1531,7 +1537,7 @@ object SessionController {
             }
             if (connectRetryAttempt >= CONNECT_RETRY_BACKOFF_MS.size) {
                 appendLog(
-                    "RETRY: 已连续失败 ${connectRetryAttempt} 轮，停止自动重试——" +
+                    "RETRY: 已连续失败 $connectRetryAttempt 轮，停止自动重试——" +
                         "请在车机上把 CarPlay 关掉再打开（或熄火重上电）后，手动点「启动连接」",
                 )
                 return
@@ -1921,7 +1927,8 @@ object SessionController {
         AccessoryDeclaration.reset()
         auditSummarizedCount = -1
         // RTSP 全量报文落盘（files/rtsp-YYYYMMDD.log）
-        io.github.shaonialife.carptocar.util.RtspDump.init(context.filesDir)
+        io.github.shaonialife.carptocar.util.RtspDump
+            .init(context.filesDir)
         // 用户明确要连：解冻恢复的前提之一（断开后再解冻不该自己爬起来）
         sessionWanted = true
         // 用户主动开链 = 解除「别再挂机」的抑制；这一轮由连接流程自己拉监听，
@@ -2208,7 +2215,9 @@ object SessionController {
         }
         if (audioSender?.isRunning == true) return
         appendLog("MODE: 会话进行中，动态补启音频通道…")
-        startAudioChannel(context, client, secret, currentAudioHost)
+        if (startAudioChannel(context, client, secret, currentAudioHost) && client.record()) {
+            audioSender?.onRecorded()
+        }
     }
 
     /**
@@ -2920,6 +2929,7 @@ object SessionController {
         val ctx = appContext ?: return true to null
         val wifiManager =
             runCatching { ctx.getSystemService(android.net.wifi.WifiManager::class.java) }.getOrNull()
+
         @Suppress("DEPRECATION")
         val enabled = runCatching { wifiManager?.isWifiEnabled == true }.getOrDefault(true)
         val connectivityManager =
@@ -3212,6 +3222,7 @@ object SessionController {
      *
      * @return true = 收到邀请 / 已发现端点；false = 等待窗口耗尽
      */
+
     /**
      * 消费「邀请先到、端点未就绪」的待决标记。
      *
@@ -3314,7 +3325,10 @@ object SessionController {
      * 所以这里只认位图：`0` = 车机明说这条流没有输入（不声明）；`null` = `/info` 没给
      * （保守不声明）；其余（含非 0）= 车机声明了输入能力，照旧挂端口。
      */
-    private fun micPortFor(candidate: AudioProfile, uplink: MicUplink?): Int {
+    private fun micPortFor(
+        candidate: AudioProfile,
+        uplink: MicUplink?,
+    ): Int {
         if (!MIC_UPLINK_ENABLED) return 0
         val bound = uplink ?: return 0
         return when (candidate.micInputDeclared) {
@@ -3581,7 +3595,7 @@ object SessionController {
         startCallWatcher()
         // 新流是在「会话已激活」之后加入的：按 AirPlay 语义必须补发 RECORD 纳入会话，
         // 否则车机对 SETUP 回 200、给端口，但不排播（见 startAudioChannel 同名注释）。
-        client.record()
+        if (client.record()) sender.onRecorded()
         appendLog(
             "AUDIO: 音频流重建完成（新 dataPort=${info.dataPort} " +
                 "controlPort=${info.controlPort}）——若仍无声，说明卡在车机音源选择而非本机",
@@ -3690,7 +3704,7 @@ object SessionController {
         if (!inCall) rejectedCallProfileKey = null
         // 新流是在「会话已激活」之后加入的：按 AirPlay 语义必须补发 RECORD 纳入会话，
         // 否则车机对 SETUP 回 200、给端口，但不排播。
-        client.record()
+        if (client.record()) sender.onRecorded()
         appendLog(
             "AUDIO: 音频流已切到 ${target.label}（dataPort=${info.dataPort} " +
                 "controlPort=${info.controlPort}）——音源不变，只换了接收端输出通路",
@@ -3719,7 +3733,6 @@ object SessionController {
             else -> VirtualIap2Link.IAP2_CALL_STATE_NONE
         }
     }
-
 
     /** 延迟 2.5 秒再重建：让车机先把通话通路的资源收干净，避免两边抢音频设备。 */
     private fun scheduleAudioRebuild() {
@@ -4340,27 +4353,31 @@ object SessionController {
             //  - 源在出帧但帧没送达：连接已好、CarLife 也在投，是链路/配置问题
             //    （典型如 SPS/VideoConfig 卡住或重连后等不到新 IDR，submitH264 返回 false）。
             val carlifePushing = CarLifeHijack.sourceActive
-            val noticeLines = if (carlifePushing) {
-                listOf("已连接但车机未收到画面", "请在车机重连或重启 CarLife+ 无线连接")
-            } else {
-                listOf("未劫持到手机车联画面", "请在手机 CarLife+ 进入「无线连接」")
-            }
+            val noticeLines =
+                if (carlifePushing) {
+                    listOf("已连接但车机未收到画面", "请在车机重连或重启 CarLife+ 无线连接")
+                } else {
+                    listOf("未劫持到手机车联画面", "请在手机 CarLife+ 进入「无线连接」")
+                }
             // 「没有 CarLife 画面」的提示已经由 startCarlifeWaitNotice 在**连上那一刻**推过了
             // （2026-11-06 用户要求：不要对着黑屏等 20 秒）。这里只在确实没提示过时才补推，
             // 避免两套文案互相覆盖、并把提示帧反复刷新。
             val recentlyNoticed =
                 android.os.SystemClock.uptimeMillis() - carlifeNoticePushedAt < NOTICE_RECENT_MS
             val pushed =
-                !recentlyNoticed && videoSender?.isRunning == true &&
+                !recentlyNoticed &&
+                    videoSender?.isRunning == true &&
                     (videoSender?.pushNotice(noticeLines) ?: false)
             appendLog(
                 "STAGE: ⚠ ${ConnectStage.FIRST_FRAME.label}超时（${budget / 1000}s 内车机未收到本会话任何视频帧，" +
                     "CarLife推流=$carlifePushing，累计送达=${CarLifeHijack.framesDelivered - base} 帧）——" +
-                    (if (carlifePushing) {
-                        "CarLife 在推流但帧未送达车机（检查 SPS/VideoConfig 或重连车机）"
-                    } else {
-                        "画面来自本机 CarLife+：确认它处于「无线连接」且引擎在推流（7240）"
-                    }) +
+                    (
+                        if (carlifePushing) {
+                            "CarLife 在推流但帧未送达车机（检查 SPS/VideoConfig 或重连车机）"
+                        } else {
+                            "画面来自本机 CarLife+：确认它处于「无线连接」且引擎在推流（7240）"
+                        }
+                    ) +
                     "；会话本身已建立，不需要重连车机" +
                     when {
                         pushed -> "；已向车机屏幕推送提示"
@@ -4378,11 +4395,12 @@ object SessionController {
                 ) {
                     sleepQuietly(5_000)
                     if (CarLifeHijack.framesDelivered > base || connectCancelled) break
-                    val linesNow = if (CarLifeHijack.sourceActive) {
-                        listOf("已连接但车机未收到画面", "请在车机重连或重启 CarLife+ 无线连接")
-                    } else {
-                        listOf("未劫持到手机车联画面", "请在手机 CarLife+ 进入「无线连接」")
-                    }
+                    val linesNow =
+                        if (CarLifeHijack.sourceActive) {
+                            listOf("已连接但车机未收到画面", "请在车机重连或重启 CarLife+ 无线连接")
+                        } else {
+                            listOf("未劫持到手机车联画面", "请在手机 CarLife+ 进入「无线连接」")
+                        }
                     videoSender?.pushNotice(linesNow)
                     repeats++
                 }
@@ -4436,7 +4454,7 @@ object SessionController {
             val receiveLine = receive ?: "车机未回报收帧统计（该固件没有 statsDictionary）"
             if (events > 0) {
                 appendLog(
-                    "STAGE: 车机接管屏幕有回落信号（首帧后 ${HANDOVER_QUIET_MS / 1000}s 内 ${events} 条事件命令：" +
+                    "STAGE: 车机接管屏幕有回落信号（首帧后 ${HANDOVER_QUIET_MS / 1000}s 内 $events 条事件命令：" +
                         carEventTypes.joinToString("、") + "；$receiveLine）",
                 )
                 return@run
@@ -4456,7 +4474,7 @@ object SessionController {
                 }
             appendLog(
                 "STAGE: ⚠ 车机对画面无任何回落信号（首帧后 ${HANDOVER_QUIET_MS / 1000}s 内事件通道 0 条命令，" +
-                    "已送达 $delivered 帧 ${activeStreamWidth}×${activeStreamHeight}；$receiveLine）\n" +
+                    "已送达 $delivered 帧 $activeStreamWidth×$activeStreamHeight；$receiveLine）\n" +
                     "  ↳ $verdict。\n" +
                     "  ↳ 对照：2026-11-03 奥迪 Q4（AUDI 3162）出画面那轮，同一条通道上收到过 " +
                     "changeModes×5、requestUI×2；要抓的是车机侧 CDSICarplayImpl 的 " +
@@ -4602,8 +4620,9 @@ object SessionController {
                 appendLog(ProtocolGeneration.describe(change))
                 ProtocolAudit.record(
                     ProtocolAudit.Code.ERA_SWITCHED,
-                    detail = "${change.from.era}/${change.from.wifiGen}" +
-                        " → ${change.to.era}/${change.to.wifiGen}",
+                    detail =
+                        "${change.from.era}/${change.from.wifiGen}" +
+                            " → ${change.to.era}/${change.to.wifiGen}",
                     evidence = "mDNS features=${change.to.featuresHex ?: "未知"} srcvers=${change.to.srcvers ?: "未知"}",
                 )
             }
@@ -4680,8 +4699,9 @@ object SessionController {
                             lastWakeAt = now
                             wakeCount++
                             val reason = "7000 已连续拒绝 $refused 次"
-                            val nudged = bluetoothServer?.nudgeCarPlayAvailability(reason) == true ||
-                                bluetoothClient?.nudgeCarPlayAvailability(reason) == true
+                            val nudged =
+                                bluetoothServer?.nudgeCarPlayAvailability(reason) == true ||
+                                    bluetoothClient?.nudgeCarPlayAvailability(reason) == true
                             ctrlAdvertiser?.ensureForNetwork(
                                 endpoint.ssid,
                                 force = true,
@@ -4837,11 +4857,13 @@ object SessionController {
                     val noPairing = txtNoPairing || pairingGate == PairingGate.SKIP_SETUP
                     appendLog(
                         "PROTO 配对策略=$pairingPolicy" +
-                            (if (noPairing) {
-                                "（本轮跳过 pair-setup）"
-                            } else {
-                                "（本轮先配对）"
-                            }) +
+                            (
+                                if (noPairing) {
+                                    "（本轮跳过 pair-setup）"
+                                } else {
+                                    "（本轮先配对）"
+                                }
+                            ) +
                             "；依据：端点 features=" +
                             (client.currentEndpoint.advertisedFeatures?.let { "0x${it.toString(16)}" } ?: "未知"),
                     )
@@ -4867,8 +4889,9 @@ object SessionController {
                         ProtocolAudit.record(
                             ProtocolAudit.Code.PAIRING_POLICY_MISMATCH,
                             detail = "画像判 $pairingPolicy（应配对），接收端不提供 /pair-setup",
-                            evidence = "features=" +
-                                (client.currentEndpoint.advertisedFeatures?.let { "0x${it.toString(16)}" } ?: "未知"),
+                            evidence =
+                                "features=" +
+                                    (client.currentEndpoint.advertisedFeatures?.let { "0x${it.toString(16)}" } ?: "未知"),
                         )
                     }
                     if (connectCancelled) {
@@ -5020,202 +5043,202 @@ object SessionController {
                                 client.activeHost ?: EndpointHosts.candidates(client.currentEndpoint.ipAddresses).firstOrNull()
                             val eventChannelOk =
                                 client.connectEventChannel(sessionKey, setup) { command ->
-                                // 车机侧「有反应」计数：屏幕接管门（startScreenHandoverGate）用它
-                                // 区分「车机压根没把这条流当屏流」与「只是画面还没上屏」。
-                                command["type"]?.toString()?.let { type ->
-                                    carEventCount++
-                                    carEventTypes.add(type)
-                                    lastCarEventAtUptime = android.os.SystemClock.uptimeMillis()
-                                }
-                                when (command["type"]) {
-                                    "hidSendReport" -> {
-                                        val uuid = command["uuid"]?.toString()
-                                        val report = command["hidReport"] as? ByteArray
-                                        // 车机媒体键（Consumer Control）走 hidSendReport 通路，
-                                        // 判定**以设备描述符为准**（不按 uuid、不按车机型号写死）：
-                                        // 描述符声明了 Consumer 页(0x0C)的设备才当媒体键，报告字节是
-                                        // Usage 数组下标（HID Array 语义）。触摸/旋钮/电话设备的描述符
-                                        // 分别是 Digitizer/GenericDesktop/Telephony 页，一律不走这里——
-                                        // DiPlay 的 knob(4B) 与 telephony(1B) 报告长度与媒体键重叠，
-                                        // 只靠长度会误判（如 telephony usage 0xB3 会误发「快进」）。
-                                        val descriptor = uuid?.let { setup.hidDescriptors[it] }
-                                        val keyMap =
-                                            descriptor?.let(ConsumerKeys::parseDescriptor)
-                                        val rawValue =
-                                            report
-                                                ?.takeIf { it.isNotEmpty() }
-                                                ?.let { it[0].toInt() and 0xFF }
-                                        val consumerUsage =
-                                            when {
-                                                // 有描述符：只有 Consumer 设备才解析（非 Consumer → null）
-                                                descriptor != null -> keyMap?.let { rawValue?.let(it::usageFor) }
-                                                // 描述符缺失（未知车机）：保守回退——仅 1 字节报告，
-                                                // 值当 Usage ID 直读
-                                                report != null && report.size == 1 -> rawValue?.takeIf { it != 0 }
-                                                else -> null
+                                    // 车机侧「有反应」计数：屏幕接管门（startScreenHandoverGate）用它
+                                    // 区分「车机压根没把这条流当屏流」与「只是画面还没上屏」。
+                                    command["type"]?.toString()?.let { type ->
+                                        carEventCount++
+                                        carEventTypes.add(type)
+                                        lastCarEventAtUptime = android.os.SystemClock.uptimeMillis()
+                                    }
+                                    when (command["type"]) {
+                                        "hidSendReport" -> {
+                                            val uuid = command["uuid"]?.toString()
+                                            val report = command["hidReport"] as? ByteArray
+                                            // 车机媒体键（Consumer Control）走 hidSendReport 通路，
+                                            // 判定**以设备描述符为准**（不按 uuid、不按车机型号写死）：
+                                            // 描述符声明了 Consumer 页(0x0C)的设备才当媒体键，报告字节是
+                                            // Usage 数组下标（HID Array 语义）。触摸/旋钮/电话设备的描述符
+                                            // 分别是 Digitizer/GenericDesktop/Telephony 页，一律不走这里——
+                                            // DiPlay 的 knob(4B) 与 telephony(1B) 报告长度与媒体键重叠，
+                                            // 只靠长度会误判（如 telephony usage 0xB3 会误发「快进」）。
+                                            val descriptor = uuid?.let { setup.hidDescriptors[it] }
+                                            val keyMap =
+                                                descriptor?.let(ConsumerKeys::parseDescriptor)
+                                            val rawValue =
+                                                report
+                                                    ?.takeIf { it.isNotEmpty() }
+                                                    ?.let { it[0].toInt() and 0xFF }
+                                            val consumerUsage =
+                                                when {
+                                                    // 有描述符：只有 Consumer 设备才解析（非 Consumer → null）
+                                                    descriptor != null -> keyMap?.let { rawValue?.let(it::usageFor) }
+                                                    // 描述符缺失（未知车机）：保守回退——仅 1 字节报告，
+                                                    // 值当 Usage ID 直读
+                                                    report != null && report.size == 1 -> rawValue?.takeIf { it != 0 }
+                                                    else -> null
+                                                }
+                                            // 触摸格式按设备描述符判定（Digitizer 页 + 单指/多槽），
+                                            // 描述符不可用时按报文长度回退——不依赖车机型号或 uuid
+                                            val touchFormat =
+                                                descriptor?.let(TouchReports::formatFromDescriptor)
+                                            val contacts =
+                                                if (consumerUsage == null && report != null) {
+                                                    TouchReports.parse(report, touchFormat)
+                                                } else {
+                                                    null
+                                                }
+                                            if (consumerUsage != null) {
+                                                val keyCode = ConsumerKeys.keyCodeFor(consumerUsage)
+                                                lastConsumerUsage = consumerUsage
+                                                if (keyCode == KeyEvent.KEYCODE_VOICE_ASSIST) {
+                                                    // 1.2.21 漏了这条通路：事件通道 hidSendReport
+                                                    // 直接调 dispatchMediaKey，语音键会被当成系统键
+                                                    // 注入而不是转给 CarLife。和 requestSiri 统一收口。
+                                                    voiceKey.onHidDown("hidSendReport 0xCF")
+                                                } else if (keyCode != 0) {
+                                                    dispatchMediaKey(keyCode)
+                                                    appendLog(
+                                                        "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
+                                                            "（uuid=$uuid usage=0x%02x → keyCode=$keyCode）"
+                                                                .format(consumerUsage),
+                                                    )
+                                                } else {
+                                                    appendLog(
+                                                        "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
+                                                            "（uuid=$uuid usage=0x%02x）无对应 Android 键，忽略"
+                                                                .format(consumerUsage),
+                                                    )
+                                                }
+                                            } else if (keyMap != null && report != null) {
+                                                // Consumer 设备的「无按键」/释放报文（值为 0 或下标越界）：
+                                                // 静默计数，避免释放事件刷屏
+                                                consumerReleaseCount++
+                                                // 但**非 0 的越界值**必须留痕：车机确实按了键、只是这个
+                                                // usage 不在描述符里（语音键 0xCF 常是这种）。以前全静默，
+                                                // 表现是「按了语音键日志一个字都没有」，分不清谁的问题。
+                                                val unmapped = rawValue ?: 0
+                                                if (unmapped != 0 && consumerUnknownCount < UNKNOWN_CONSUMER_LOG_LIMIT) {
+                                                    consumerUnknownCount += 1
+                                                    appendLog(
+                                                        "EVENT: HID 报告 uuid=$uuid 值=0x%02x 映射不到 usage"
+                                                            .format(unmapped) +
+                                                            "（描述符声明 ${keyMap.usages.size} 项：" +
+                                                            keyMap.usages.joinToString(" ") { "0x%02x".format(it) } +
+                                                            "）——车机按了键但我们没声明这项",
+                                                    )
+                                                }
+                                                if (lastConsumerUsage?.let(ConsumerKeys::keyCodeFor) ==
+                                                    KeyEvent.KEYCODE_VOICE_ASSIST
+                                                ) {
+                                                    voiceKey.onHidUp("hidSendReport 0xCF")
+                                                }
+                                                lastConsumerUsage = null
+                                            } else if (contacts != null) {
+                                                // 限频只压 MOVE（拖拽时每秒上百条）；
+                                                // **抬起永远记录**——排查手势卡死时最需要看的就是
+                                                // 「UP 到底有没有从车机发过来」。
+                                                // 只看 slot 0：多槽格式里 slot 1 常驻 (0,0)↑ 占位。
+                                                if (touchLogCount == 0) {
+                                                    // 双指能不能用，第一眼看这里：单指绝对坐标的
+                                                    // 报文里根本没有第二个触点的位置，双指无从谈起。
+                                                    appendLog(
+                                                        "EVENT: 触摸格式 " +
+                                                            when (touchFormat) {
+                                                                TouchReports.Format.MULTI_SLOT -> "多槽（最多 2 指）"
+                                                                TouchReports.Format.SINGLE_ABSOLUTE -> "单指绝对坐标（车机只报一个触点）"
+                                                                null -> "未知（按报文长度 ${report?.size} B 回退）"
+                                                            },
+                                                    )
+                                                }
+                                                val hasRelease = contacts.any { it.slot == 0 && !it.down }
+                                                if (hasRelease || touchLogCount <= 30 || touchLogCount % 50 == 0) {
+                                                    appendLog(
+                                                        "EVENT: 触摸 " +
+                                                            contacts.joinToString {
+                                                                "#${it.slot}(${it.xPixels},${it.yPixels})${if (it.down) "↓" else "↑"}"
+                                                            },
+                                                    )
+                                                }
+                                                touchLogCount++
+                                                contacts.forEach {
+                                                    TouchRouter.onContact(
+                                                        context.applicationContext,
+                                                        it,
+                                                    )
+                                                }
+                                            } else if (report != null) {
+                                                appendLog(
+                                                    "EVENT: 其他 HID 报告 uuid=$uuid bytes=${report.size}" +
+                                                        " hex=${report.joinToString(" ") { "%02x".format(it) }}",
+                                                )
                                             }
-                                        // 触摸格式按设备描述符判定（Digitizer 页 + 单指/多槽），
-                                        // 描述符不可用时按报文长度回退——不依赖车机型号或 uuid
-                                        val touchFormat =
-                                            descriptor?.let(TouchReports::formatFromDescriptor)
-                                        val contacts =
-                                            if (consumerUsage == null && report != null) {
-                                                TouchReports.parse(report, touchFormat)
+                                        }
+
+                                        "iAPSendMessage" -> {
+                                            // 事件通道上的 iAP2 虚拟链路字节（车机先发 marker 开场）。
+                                            // 喂给链路引擎：握手 → 触摸 HID（EA 车机控制已移除）。
+                                            val params = command["params"] as? Map<*, *>
+                                            val data = params?.get("data") as? ByteArray
+                                            if (data == null) {
+                                                appendLog("EVENT: iAPSendMessage 无 data（params=$params）")
                                             } else {
-                                                null
+                                                iapEventMessageCount++
+                                                client.onIapEventBytes(data)
                                             }
-                                        if (consumerUsage != null) {
-                                            val keyCode = ConsumerKeys.keyCodeFor(consumerUsage)
-                                            lastConsumerUsage = consumerUsage
-                                            if (keyCode == KeyEvent.KEYCODE_VOICE_ASSIST) {
-                                                // 1.2.21 漏了这条通路：事件通道 hidSendReport
-                                                // 直接调 dispatchMediaKey，语音键会被当成系统键
-                                                // 注入而不是转给 CarLife。和 requestSiri 统一收口。
-                                                voiceKey.onHidDown("hidSendReport 0xCF")
-                                            } else if (keyCode != 0) {
-                                                dispatchMediaKey(keyCode)
-                                                appendLog(
-                                                    "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
-                                                        "（uuid=$uuid usage=0x%02x → keyCode=$keyCode）"
-                                                            .format(consumerUsage),
-                                                )
-                                            } else {
-                                                appendLog(
-                                                    "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
-                                                        "（uuid=$uuid usage=0x%02x）无对应 Android 键，忽略"
-                                                            .format(consumerUsage),
-                                                )
-                                            }
-                                        } else if (keyMap != null && report != null) {
-                                            // Consumer 设备的「无按键」/释放报文（值为 0 或下标越界）：
-                                            // 静默计数，避免释放事件刷屏
-                                            consumerReleaseCount++
-                                            // 但**非 0 的越界值**必须留痕：车机确实按了键、只是这个
-                                            // usage 不在描述符里（语音键 0xCF 常是这种）。以前全静默，
-                                            // 表现是「按了语音键日志一个字都没有」，分不清谁的问题。
-                                            val unmapped = rawValue ?: 0
-                                            if (unmapped != 0 && consumerUnknownCount < UNKNOWN_CONSUMER_LOG_LIMIT) {
-                                                consumerUnknownCount += 1
-                                                appendLog(
-                                                    "EVENT: HID 报告 uuid=$uuid 值=0x%02x 映射不到 usage"
-                                                        .format(unmapped) +
-                                                        "（描述符声明 ${keyMap.usages.size} 项：" +
-                                                        keyMap.usages.joinToString(" ") { "0x%02x".format(it) } +
-                                                        "）——车机按了键但我们没声明这项",
-                                                )
-                                            }
-                                            if (lastConsumerUsage?.let(ConsumerKeys::keyCodeFor) ==
-                                                KeyEvent.KEYCODE_VOICE_ASSIST
-                                            ) {
-                                                voiceKey.onHidUp("hidSendReport 0xCF")
-                                            }
-                                            lastConsumerUsage = null
-                                        } else if (contacts != null) {
-                                            // 限频只压 MOVE（拖拽时每秒上百条）；
-                                            // **抬起永远记录**——排查手势卡死时最需要看的就是
-                                            // 「UP 到底有没有从车机发过来」。
-                                            // 只看 slot 0：多槽格式里 slot 1 常驻 (0,0)↑ 占位。
-                                            if (touchLogCount == 0) {
-                                                // 双指能不能用，第一眼看这里：单指绝对坐标的
-                                                // 报文里根本没有第二个触点的位置，双指无从谈起。
-                                                appendLog(
-                                                    "EVENT: 触摸格式 " +
-                                                        when (touchFormat) {
-                                                            TouchReports.Format.MULTI_SLOT -> "多槽（最多 2 指）"
-                                                            TouchReports.Format.SINGLE_ABSOLUTE -> "单指绝对坐标（车机只报一个触点）"
-                                                            null -> "未知（按报文长度 ${report?.size} B 回退）"
-                                                        },
-                                                )
-                                            }
-                                            val hasRelease = contacts.any { it.slot == 0 && !it.down }
-                                            if (hasRelease || touchLogCount <= 30 || touchLogCount % 50 == 0) {
-                                                appendLog(
-                                                    "EVENT: 触摸 " +
-                                                        contacts.joinToString {
-                                                            "#${it.slot}(${it.xPixels},${it.yPixels})${if (it.down) "↓" else "↑"}"
-                                                        },
-                                                )
-                                            }
-                                            touchLogCount++
-                                            contacts.forEach {
-                                                TouchRouter.onContact(
-                                                    context.applicationContext,
-                                                    it,
-                                                )
-                                            }
-                                        } else if (report != null) {
+                                        }
+
+                                        "requestSiri" -> {
+                                            // 方向盘的语音键（2026-11-03 08:52 手机日志实测）：
+                                            // 车机在事件通道发 type=requestSiri，params.siriAction =
+                                            // 1 Prewarm（预热）/ 2 ButtonDown / 3 ButtonUp
+                                            // —— 来自 Apple AirPlayCommon.h 的 AirPlaySiriAction。
+                                            // 它**不走** 0x6802 HID 0xCF，所以 1.2.21 那条语音键
+                                            // 链路在这台车上是死代码；这里才是真正的入口。
+                                            val params = command["params"] as? Map<*, *>
+                                            val raw = params?.get("siriAction")
+                                            val action =
+                                                when (raw) {
+                                                    is Number -> raw.toInt()
+                                                    else -> raw?.toString()?.trim()?.toIntOrNull()
+                                                }
+                                            voiceKey.onSiriAction(action)
+                                        }
+
+                                        "forceKeyFrame" -> {
+                                            // 车机解不出画面时会要 I 帧。必须立即响应：
+                                            // 拖到下一个周期 I 帧（1s）车机可能一直卡在等帧状态。
+                                            val forced = videoSender?.requestKeyFrame() == true
                                             appendLog(
-                                                "EVENT: 其他 HID 报告 uuid=$uuid bytes=${report.size}" +
-                                                    " hex=${report.joinToString(" ") { "%02x".format(it) }}",
+                                                "EVENT: 车机请求关键帧（forceKeyFrame）→ " +
+                                                    if (forced) "已强制编码 I 帧" else "编码器未就绪，等周期 I 帧",
                                             )
                                         }
+
+                                        // 车机请求资源仲裁。回的是**当前实际归属**，不是「手机接管」：
+                                        // 车机接管/归还/借用是三种不同语义，一律回「屏永远是我的」
+                                        // 等于答非所问（旧实现如此）。真车会发：奥迪 4260 在
+                                        // 2026-11-09 09:38/09:42/09:43 共发 7 次 changeModes + 1 次 requestUI。
+                                        // requestUI 是同一套仲裁里的「把界面交回手机」，走同一个出口。
+                                        "changeModes", "requestUI" ->
+                                            client.handleModeCommand(command)
+
+                                        else ->
+                                            appendLog(
+                                                // 未识别的命令必须带参数：车机的私有命令（如 requestUI）
+                                                // 到底要什么，全在 params 里——只打 type 等于没打。
+                                                "EVENT: 命令 type=${command["type"]} " +
+                                                    command.entries
+                                                        .filter { it.key?.toString() != "type" }
+                                                        .joinToString(" ") { (key, value) ->
+                                                            "$key=" +
+                                                                when (value) {
+                                                                    is ByteArray -> value.joinToString("") { "%02x".format(it) }
+                                                                    else -> value.toString().take(240)
+                                                                }
+                                                        }.take(600),
+                                            )
                                     }
-
-                                    "iAPSendMessage" -> {
-                                        // 事件通道上的 iAP2 虚拟链路字节（车机先发 marker 开场）。
-                                        // 喂给链路引擎：握手 → 触摸 HID（EA 车机控制已移除）。
-                                        val params = command["params"] as? Map<*, *>
-                                        val data = params?.get("data") as? ByteArray
-                                        if (data == null) {
-                                            appendLog("EVENT: iAPSendMessage 无 data（params=$params）")
-                                        } else {
-                                            iapEventMessageCount++
-                                            client.onIapEventBytes(data)
-                                        }
-                                    }
-
-                                    "requestSiri" -> {
-                                        // 方向盘的语音键（2026-11-03 08:52 手机日志实测）：
-                                        // 车机在事件通道发 type=requestSiri，params.siriAction =
-                                        // 1 Prewarm（预热）/ 2 ButtonDown / 3 ButtonUp
-                                        // —— 来自 Apple AirPlayCommon.h 的 AirPlaySiriAction。
-                                        // 它**不走** 0x6802 HID 0xCF，所以 1.2.21 那条语音键
-                                        // 链路在这台车上是死代码；这里才是真正的入口。
-                                        val params = command["params"] as? Map<*, *>
-                                        val raw = params?.get("siriAction")
-                                        val action =
-                                            when (raw) {
-                                                is Number -> raw.toInt()
-                                                else -> raw?.toString()?.trim()?.toIntOrNull()
-                                            }
-                                        voiceKey.onSiriAction(action)
-                                    }
-
-                                    "forceKeyFrame" -> {
-                                        // 车机解不出画面时会要 I 帧。必须立即响应：
-                                        // 拖到下一个周期 I 帧（1s）车机可能一直卡在等帧状态。
-                                        val forced = videoSender?.requestKeyFrame() == true
-                                        appendLog(
-                                            "EVENT: 车机请求关键帧（forceKeyFrame）→ " +
-                                                if (forced) "已强制编码 I 帧" else "编码器未就绪，等周期 I 帧",
-                                        )
-                                    }
-
-                                    // 车机请求资源仲裁。回的是**当前实际归属**，不是「手机接管」：
-                                    // 车机接管/归还/借用是三种不同语义，一律回「屏永远是我的」
-                                    // 等于答非所问（旧实现如此）。真车会发：奥迪 4260 在
-                                    // 2026-11-09 09:38/09:42/09:43 共发 7 次 changeModes + 1 次 requestUI。
-                                    // requestUI 是同一套仲裁里的「把界面交回手机」，走同一个出口。
-                                    "changeModes", "requestUI" ->
-                                        client.handleModeCommand(command)
-
-                                    else ->
-                                        appendLog(
-                                            // 未识别的命令必须带参数：车机的私有命令（如 requestUI）
-                                            // 到底要什么，全在 params 里——只打 type 等于没打。
-                                            "EVENT: 命令 type=${command["type"]} " +
-                                                command.entries
-                                                    .filter { it.key?.toString() != "type" }
-                                                    .joinToString(" ") { (key, value) ->
-                                                        "$key=" +
-                                                            when (value) {
-                                                                is ByteArray -> value.joinToString("") { "%02x".format(it) }
-                                                                else -> value.toString().take(240)
-                                                            }
-                                                    }.take(600),
-                                        )
                                 }
-                            }
                             // 「半握手」判定（2026-11-02 MBUX 两轮实测）：
                             // SETUP 回了 200，但 /info 一条 displays 都没给、事件通道还连不上——
                             // 车机只是答应了前半段，后面什么都不通。此时按手机屏幕尺寸
@@ -5393,18 +5416,20 @@ object SessionController {
                                     activeStreamHeight = streamOutH
                                     appendLog(
                                         "DISPLAY: 车机 ${setup.displayWidth}×${setup.displayHeight}" +
-                                            (if (setup.displayFromCar) {
-                                                "（/info 通告）"
-                                            } else {
-                                                "（车机未通告·手机横屏兜底）"
-                                            }) +
-                                            " → 流 ${streamOutW}×${streamOutH}（$scalePct%）" +
+                                            (
+                                                if (setup.displayFromCar) {
+                                                    "（/info 通告）"
+                                                } else {
+                                                    "（车机未通告·手机横屏兜底）"
+                                                }
+                                            ) +
+                                            " → 流 $streamOutW×$streamOutH（$scalePct%）" +
                                             "@${sessionTargetFps}fps（${StreamFps.describe(setup.maxFps)}）",
                                     )
                                     if (streamOutW != streamW || streamOutH != streamH) {
                                         appendLog(
                                             "DISPLAY: 码流尺寸由 CarLife 引擎决定（申请 " +
-                                                "${streamW}×$streamH，建链时刻 ${streamOutW}×$streamOutH）" +
+                                                "$streamW×$streamH，建链时刻 $streamOutW×$streamOutH）" +
                                                 "——引擎收到车机分辨率后会重建编码器，实际尺寸以界面显示为准",
                                         )
                                     }
@@ -5589,13 +5614,14 @@ object SessionController {
                                             appContext?.let { ctx ->
                                                 DisplayPrefs.updateLastStream(ctx, w, h)
                                             }
-                                            val negotiated = activeCarWidth > 0 &&
-                                                (w != activeCarWidth || h != activeCarHeight)
+                                            val negotiated =
+                                                activeCarWidth > 0 &&
+                                                    (w != activeCarWidth || h != activeCarHeight)
                                             appendLog(
-                                                "DISPLAY: 实际码流 ${w}×$h" +
+                                                "DISPLAY: 实际码流 $w×$h" +
                                                     if (negotiated) {
                                                         "（引擎降档，车机画布 " +
-                                                            "${activeCarWidth}×${activeCarHeight}）"
+                                                            "$activeCarWidth×$activeCarHeight）"
                                                     } else {
                                                         ""
                                                     },
@@ -5627,7 +5653,8 @@ object SessionController {
                                     // 音频已在本轮 RECORD 之前 SETUP 完成：那次 RECORD 就是
                                     // 同时纳入视频+音频的那一次，**绝不能再补发**——JYBOX-80
                                     // 对「流后补 RECORD」直接 500 并关掉 AirPlay 服务（issue #14）。
-                                    if (audioStartedBeforeRecord) {
+                                    if (audioStartedBeforeRecord && firstRecordOk) {
+                                        audioSender?.onRecorded()
                                         appendLog("AUDIO: 音频已随本次 RECORD 一同激活（未补发 RECORD）")
                                     }
                                     if (MIC_PROBE_ENABLED && audioStartedBeforeRecord) runMicProbe(client)
@@ -5640,7 +5667,9 @@ object SessionController {
                                         // 并给 dataPort，但不会真正播放（2026-10-17 奥迪实测：
                                         // 音频包持续发送、采集内容非零，车机无声）。
                                         appendLog("AUDIO: 音频流已加入——补发 RECORD 激活（流后加入会话）")
-                                        if (!client.record()) {
+                                        if (client.record()) {
+                                            audioSender?.onRecorded()
+                                        } else {
                                             // 这台接收端受不了「流后补 RECORD」：记住它，下一轮
                                             // 改走音频优先（先 SETUP 音频再一次 RECORD）。本轮
                                             // 已经废了（它多半会顺手关掉 AirPlay 服务），没有
@@ -5653,7 +5682,7 @@ object SessionController {
                                         }
                                         if (MIC_PROBE_ENABLED) runMicProbe(client)
                                     } else if (audioStarted) {
-                                        // P1 单变量实验（2026-11-09）：不补发那一次 RECORD。
+                                        if (firstRecordOk) audioSender?.onRecorded()
                                         // 宝马 G38/F22 三份日志（18:19 / 18:22 / 18:24）100%
                                         // 复现同一形态——音频 SETUP 200、补发 RECORD 完成，
                                         // 16/25/36ms 后车机关掉控制通道并 EOF，pi 每次都变
@@ -5910,7 +5939,9 @@ object SessionController {
     private var carEventCount = 0
 
     /** 车机发过的事件命令 `type` 集合（去重，仅日志诊断用）。 */
-    private val carEventTypes = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val carEventTypes =
+        java.util.concurrent.ConcurrentHashMap
+            .newKeySet<String>()
 
     /** 最近一次收到车机事件命令的 `uptimeMillis`（0 = 从没收到）。 */
     @Volatile
