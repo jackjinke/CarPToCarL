@@ -840,11 +840,12 @@ object CarLifeHijack {
     }
 
     /** 会话结束：断开视频通道，回到「只缓存」状态（CarLife 连接保持不断）。 */
-    fun detach() {
-        sender = null
-        firstDeliverLogged = false
-        deliverWindowFrames = 0
-    }
+    fun detach() =
+        synchronized(videoDeliveryLock) {
+            sender = null
+            firstDeliverLogged = false
+            deliverWindowFrames = 0
+        }
 
     /** 完全停止（退出 App / 关闭开关）。 */
     fun stop() {
@@ -882,6 +883,7 @@ object CarLifeHijack {
 
     private fun workerLoop() {
         var announcedWait = false
+        var restartArmed = false
         while (running.get()) {
             // 2026-10-25 回滚：**不再自动拉起** CarLife 引擎。
             // 自动拉起（bindService / startForegroundService / CarlifeActivity）实测能让
@@ -981,13 +983,17 @@ object CarLifeHijack {
                 )
             // start() 在握手返回前就会拉起视频读线程：必须先用旧会话栅栏通知解码状态复位，
             // 避免新读线程先送出首帧 IDR 后再被复位冲掉。
-            synchronized(videoDeliveryLock) {
-                sender?.let { target ->
-                    screenReactivateNeeded = true
-                    target.onSourceRestart("CarLife 会话重建（引擎重连）")
+            if (!restartArmed) {
+                synchronized(videoDeliveryLock) {
+                    sender?.let { target ->
+                        screenReactivateNeeded = true
+                        target.onSourceRestart("CarLife 会话重建（引擎重连）")
+                        restartArmed = true
+                    }
                 }
             }
             if (hu.start()) {
+                restartArmed = false
                 client = hu
                 if (requestedW > 0 && requestedH > 0) {
                     hu.setRequestedResolution(requestedW, requestedH)
