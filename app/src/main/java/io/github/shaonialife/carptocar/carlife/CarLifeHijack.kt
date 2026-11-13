@@ -266,8 +266,8 @@ object CarLifeHijack {
         synchronized(audioPlaybackLock) {
             if (!running.get()) return@synchronized
             val playing = knownMediaPlaying()
-            audioSink?.setPlaybackPaused(playing == false)
             mediaPlayback.onSessionPlayback(playing)
+            audioSink?.setPlaybackPaused(!mediaPlayback.canForwardPcm)
             updateAudioPlayback(media = mediaPlayback.playing)
         }
     }
@@ -280,10 +280,10 @@ object CarLifeHijack {
             if (!running.get()) return@synchronized false
             audioSink = sink
             ttsSink = navigationSink
-            mediaPlayback.transportChanged()
+            mediaPlayback.reset()
             val playing = knownMediaPlaying()
             mediaPlayback.onSessionPlayback(playing)
-            sink.setPlaybackPaused(playing == false)
+            sink.setPlaybackPaused(!mediaPlayback.canForwardPcm)
             updateAudioPlayback(media = mediaPlayback.playing, navigation = false)
             true
         }
@@ -535,6 +535,7 @@ object CarLifeHijack {
         val pauseAction = MediaSessionsState.transportActionFor(android.view.KeyEvent.KEYCODE_MEDIA_PAUSE)
         val sessionDispatched = pauseAction >= 0 && MediaSessionsState.dispatchTransport(pauseAction)
         val hu = client
+        hu?.noteMediaExpectationChanged()
         val hardKeySent = hu?.sendHardKeyCode(CarLifeProtocol.HardKey.MEDIA_STOP) == true
         hu?.sendPauseMedia()
         if (wasPlaying || sessionDispatched || hardKeySent) {
@@ -557,7 +558,9 @@ object CarLifeHijack {
         }
         val playAction = MediaSessionsState.transportActionFor(android.view.KeyEvent.KEYCODE_MEDIA_PLAY)
         val sessionDispatched = playAction >= 0 && MediaSessionsState.dispatchTransport(playAction)
-        val hardKeySent = client?.sendHardKeyCode(CarLifeProtocol.HardKey.MEDIA_START) == true
+        val hu = client
+        hu?.noteMediaExpectationChanged()
+        val hardKeySent = hu?.sendHardKeyCode(CarLifeProtocol.HardKey.MEDIA_START) == true
         logSink?.invoke("CARLIFE: $reason → 恢复媒体播放（session=$sessionDispatched hardKey=$hardKeySent）")
         return sessionDispatched || hardKeySent
     }
@@ -1038,9 +1041,9 @@ object CarLifeHijack {
         synchronized(audioPlaybackLock) {
             if (audioSink !== sink) return
             val sessionPlaying = knownMediaPlaying()
-            sink.setPlaybackPaused(sessionPlaying == false)
             mediaPlayback.onSessionPlayback(sessionPlaying)
             mediaPlayback.onActivity(activity)
+            sink.setPlaybackPaused(!mediaPlayback.canForwardPcm)
             val playing = mediaPlayback.playing
             updateAudioPlayback(
                 media = playing,
