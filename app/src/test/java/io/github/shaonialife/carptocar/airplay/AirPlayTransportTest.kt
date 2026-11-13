@@ -198,6 +198,85 @@ class AirPlayTransportTest {
         }
     }
 
+    @Test(timeout = 20_000)
+    fun `已建立会话被对端关闭时回调仍能观测到 wasSessionEstablished`() {
+        ServerSocket(0).use { server ->
+            server.soTimeout = 5_000
+            val closed = CountDownLatch(1)
+            val allowPeerClose = CountDownLatch(1)
+            val observedEstablished = AtomicReference<Boolean>()
+            val observedCancelled = AtomicReference<Boolean>()
+            val client =
+                AirPlayClient(
+                    endpoint(server.localPort, listOf(localHost())),
+                    {},
+                    onTransportClosed = { failed, _ ->
+                        observedEstablished.set(failed.wasSessionEstablished)
+                        observedCancelled.set(failed.cancelled)
+                        closed.countDown()
+                    },
+                )
+            val setupReplyBody = BinaryPlist.encode(linkedMapOf("eventPort" to 0L, "timingPort" to 0L))
+            val receiver =
+                Thread {
+                    server.accept().use { peer ->
+                        val input = peer.getInputStream()
+                        // 依次应答 SETUP /setup 与 GET /info，使 runSetup() 完整返回后再由对端关闭触发 control EOF
+                        repeat(2) {
+                            val headerBuf = StringBuilder()
+                            while (!headerBuf.endsWith("\r\n\r\n")) {
+                                val b = input.read()
+                                if (b < 0) return@use
+                                headerBuf.append(b.toChar())
+                            }
+                            val headers = headerBuf.toString().lines()
+                            val cseq = headers.first { it.startsWith("CSeq:", ignoreCase = true) }.substringAfter(':').trim()
+                            val contentLen =
+                                headers
+                                    .firstOrNull { it.startsWith("Content-Length:", ignoreCase = true) }
+                                    ?.substringAfter(':')
+                                    ?.trim()
+                                    ?.toIntOrNull() ?: 0
+                            var remaining = contentLen
+                            val scratch = ByteArray(512)
+                            while (remaining > 0) {
+                                val n = input.read(scratch, 0, minOf(remaining, scratch.size))
+                                if (n <= 0) return@use
+                                remaining -= n
+                            }
+                            val head =
+                                "RTSP/1.0 200 OK\r\nCSeq: $cseq\r\n" +
+                                    "Content-Type: application/x-apple-binary-plist\r\n" +
+                                    "Content-Length: ${setupReplyBody.size}\r\n\r\n"
+                            peer.getOutputStream().write(head.toByteArray())
+                            peer.getOutputStream().write(setupReplyBody)
+                            peer.getOutputStream().flush()
+                        }
+                        allowPeerClose.await(5, TimeUnit.SECONDS)
+                    }
+                }.apply {
+                    isDaemon = true
+                    start()
+                }
+            try {
+                assertTrue(client.reconnect(1_000))
+                val setup = client.runSetup()
+                assertTrue(setup != null)
+                assertTrue(client.wasSessionEstablished)
+                allowPeerClose.countDown()
+                assertTrue(closed.await(3, TimeUnit.SECONDS))
+                assertEquals(true, observedEstablished.get())
+                assertEquals(true, observedCancelled.get())
+                assertFalse(client.sessionEstablished)
+            } finally {
+                allowPeerClose.countDown()
+                client.cancelled = true
+                client.close()
+                receiver.join(2_000)
+            }
+        }
+    }
+
     private fun client(
         port: Int,
         onClosed: () -> Unit,

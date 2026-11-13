@@ -21,11 +21,13 @@ internal class VirtualIap2DeviceState(
                 .toString()
                 .uppercase()
                 .also { sessionId = it }
-        send(0x4E0C, Iap2Csm.param(0, id.toByteArray(Charsets.UTF_8)))
-        send(0x4E0A, Iap2Csm.param(0, "zh".toByteArray(Charsets.UTF_8)))
+        val language = AccessoryDeclaration.deviceLanguage("zh")
+        // iAP2 UTF-8 字符串参数必须以 NUL (0x00) 结尾，否则严格校验的车机解析器会立即断开控制会话。
+        send(0x4E0C, Iap2Csm.string(0, id))
+        send(0x4E0A, Iap2Csm.string(0, language))
         send(0x4E0B, timeParams())
-        send(0x4E09, Iap2Csm.param(0, "iPhone".toByteArray(Charsets.UTF_8)))
-        log("IAPLINK: 认证后设备状态已上报（无线会话标识 $id）")
+        send(0x4E09, Iap2Csm.string(0, "iPhone"))
+        log("IAPLINK: 认证后设备状态已上报（无线会话标识 $id，语言=$language）")
     }
 
     private fun timeParams(): ByteArray {

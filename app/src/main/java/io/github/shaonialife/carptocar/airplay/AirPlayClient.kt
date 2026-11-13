@@ -98,6 +98,10 @@ class AirPlayClient(
     var sessionEstablished: Boolean = false
         private set
 
+    /** 本实例生命周期内是否曾完成过会话级 SETUP（供对端断链收尾在传输清理后仍能识别已建立会话）。 */
+    @Volatile
+    var wasSessionEstablished: Boolean = false
+        private set
     val controlSessionAlive: Boolean get() = !cancelled && socket?.isClosed == false
     private val modes = AirPlayResourceState()
     private val modesPublicationLock = Any()
@@ -1384,6 +1388,7 @@ class AirPlayClient(
         synchronized(transportLock) {
             if (!controlSessionAlive) return null
             sessionEstablished = true
+            wasSessionEstablished = true
         }
         val root =
             try {

@@ -506,7 +506,12 @@ object SessionController {
         // 第三方播放器不触发 CarLife 的 0x10035，歌名只能从 MediaSession 拿。
         MediaSessionsState.addListener {
             val np = MediaSessionsState.nowPlaying
-            onSourceAudioPlayback(media = np?.playing == true, navigation = false)
+            // CarLife 劫持启用时，媒体与导航双轨播放门控统一由 CarLifeHijack 仲裁上报；
+            // 仅在非劫持模式且确有系统媒体会话快照时转发播放态，避免无通知权限时 null 覆盖真实音源。
+            val hijackEnabled = appContext?.let { CarLifeHijack.isEnabled(it) } ?: true
+            if (!hijackEnabled && np != null) {
+                onSourceAudioPlayback(media = np.playing, navigation = false)
+            }
             if (np != null) {
                 appendLog(
                     "EVENT: MediaSession 歌名「${np.title ?: "?"}」→ 补推 iAP2 0x5001 NowPlayingUpdate",
@@ -1223,7 +1228,9 @@ object SessionController {
     ) {
         synchronized(sessionLifecycleLock) {
             if (currentClient !== client) return
-            val wasEstablished = client.sessionEstablished
+            val wasEstablished = client.wasSessionEstablished
+            val settledAuthKey = authReceiverKey
+            authReceiverKey = null
             if (attributeAudio) attributeAudioTeardown()
             videoSessionEnded = true
             phaseHint = "CarPlay 会话已结束：$reason"
@@ -1239,6 +1246,7 @@ object SessionController {
             val pending = pendingEndpointUpdate
             pendingEndpointUpdate = null
             if (wasEstablished) {
+                settledAuthKey?.let { freshAuthPolicy.onResult(it, true) }
                 // 已建立的会话由车机侧关闭（如车机界面点击断开 CarPlay）：不发起主动重连风暴，
                 // 同时记录对端断链避让窗口，交由车机主动回连或下发新的连接邀请。
                 BtSessionGate.noteRemoteSessionEnded()
@@ -1382,6 +1390,7 @@ object SessionController {
             // 只要 AirPlay 会话已建立或屏幕/资源流仍在生命周期内，绝不能误杀 WiFi 会话。
             if (videoSender?.isRunning == true ||
                 resourceStreams != null ||
+                currentClient?.controlSessionAlive == true ||
                 currentClient?.sessionEstablished == true
             ) {
                 return
@@ -2030,7 +2039,9 @@ object SessionController {
      * 车机回连」时也是 true，可能持续几分钟；而这里只认「画面真的在送」。
      * 车机远离后的收摊判定用这个——否则永远判为「会话还在跑」，收摊永不生效。
      */
-    fun isStreaming(): Boolean = videoSender?.isRunning == true
+    fun isStreaming(): Boolean =
+        videoSender?.isRunning == true ||
+            (resourceStreams != null && currentClient?.controlSessionAlive == true)
 
     /**
      * 通知栏的一句话状态（[io.github.shaonialife.carptocar.service.CarPlayService] 每 3 秒取一次）。
@@ -4958,6 +4969,7 @@ object SessionController {
                 synchronized(pairingWorkerLock) {
                     if (!ownsAttempt(attempt)) return@run
                     workerAttempt.set(attempt)
+                    authReceiverKey = null
                     try {
                         if (!ownsAttempt(attempt)) {
                             appendLog("AIRPLAY: 用户已取消——中止配对")
@@ -6106,7 +6118,9 @@ object SessionController {
                         synchronized(sessionLifecycleLock) {
                             if (ownsAttempt(attempt)) {
                                 val sessionLive =
-                                    videoSender?.isRunning == true || resourceStreams?.screenPaused == true
+                                    videoSender?.isRunning == true ||
+                                        resourceStreams?.screenPaused == true ||
+                                        currentClient?.wasSessionEstablished == true
                                 if (!sessionLive) {
                                     connectBudget.end(
                                         cause = phaseHint ?: "",
@@ -6116,7 +6130,9 @@ object SessionController {
                                     appendLog(connectBudget.summary())
                                 }
                                 releaseAttempt(attempt)
-                                authReceiverKey?.let { key ->
+                                val settledKey = authReceiverKey
+                                authReceiverKey = null
+                                settledKey?.let { key ->
                                     when {
                                         sessionLive -> freshAuthPolicy.onResult(key, true)
                                         !connectCancelled ->
