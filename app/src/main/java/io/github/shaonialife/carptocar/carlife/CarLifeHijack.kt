@@ -27,12 +27,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  * ```
  */
 object CarLifeHijack {
-
     private const val PREFS = "settings"
     private const val KEY_ENABLED = "carlife_hijack_enabled"
 
     /** 向 CarLife 引擎申请的编码帧率（60 = 跟手，30 = 省电）。 */
     private const val KEY_FPS = "carlife_fps"
+
     /**
      * 目标编码帧率。
      *
@@ -345,6 +345,9 @@ object CarLifeHijack {
     private var gopBytes = 0
     private val gopLock = Any()
 
+    /** 串行化缓存 GOP 回放与实时帧投递，保证 VideoConfig 与首个 IDR 严格先于后续 P 帧；收尾保持无锁以便打断阻塞写。 */
+    private val videoDeliveryLock = Any()
+
     /**
      * 最近一次见到的 SPS+PPS（含起始码）。
      *
@@ -371,8 +374,9 @@ object CarLifeHijack {
      * 它仍挂着 true，会误导「未劫持/已劫持」的判断；本属性带新鲜度，不会。
      */
     val sourceActive: Boolean
-        get() = lastSourceFrameAt > 0 &&
-            android.os.SystemClock.uptimeMillis() - lastSourceFrameAt < 10_000
+        get() =
+            lastSourceFrameAt > 0 &&
+                android.os.SystemClock.uptimeMillis() - lastSourceFrameAt < 10_000
 
     /** 已成功写进车机通道的帧数（区分「握手成功」与「车机真在收画面」）。 */
     @Volatile
@@ -421,8 +425,7 @@ object CarLifeHijack {
      * **自己的麦克风**起语音识别，不需要我们回传车机麦克风，所以这里只是一条控制命令，
      * 不牵扯音频通道。
      */
-    fun sendVoiceKey(keycode: Int = CarLifeProtocol.HardKey.VR_START): Boolean =
-        client?.sendHardKeyCode(keycode) ?: false
+    fun sendVoiceKey(keycode: Int = CarLifeProtocol.HardKey.VR_START): Boolean = client?.sendHardKeyCode(keycode) ?: false
 
     /**
      * 当前 CarLife **引擎确认**的编码分辨率（65544 回显值），prewarm 阶段即可用于
@@ -482,7 +485,8 @@ object CarLifeHijack {
         // v3 迁移：画面唯一来源就是 CarLife 劫持，默认改回开启。老安装若被 v2 关掉过，
         // 这里一次性打开；之后完全尊重用户在设置里的选择。
         if (!prefs.getBoolean(KEY_MIGRATED_ON_V3, false)) {
-            prefs.edit()
+            prefs
+                .edit()
                 .putBoolean(KEY_ENABLED, true)
                 .putBoolean(KEY_MIGRATED_ON_V3, true)
                 .apply()
@@ -490,9 +494,15 @@ object CarLifeHijack {
         return prefs.getBoolean(KEY_ENABLED, true)
     }
 
-    fun setEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putBoolean(KEY_ENABLED, enabled).apply()
+    fun setEnabled(
+        context: Context,
+        enabled: Boolean,
+    ) {
+        context
+            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_ENABLED, enabled)
+            .apply()
     }
 
     /**
@@ -536,28 +546,34 @@ object CarLifeHijack {
         hasVideo = false
         lastSourceFrameAt = 0L
         stallSince = 0L
-        requestedFps = context
-            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getInt(KEY_FPS, DEFAULT_FPS)
-            .coerceIn(3, 60)
-        connectType = context
-            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getInt(KEY_CONNECT_TYPE, DEFAULT_CONNECT_TYPE)
-            .coerceIn(1, 8)
-        connectTypeProbe = context
-            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getBoolean(KEY_CONNECT_TYPE_PROBE, false)
+        requestedFps =
+            context
+                .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getInt(KEY_FPS, DEFAULT_FPS)
+                .coerceIn(3, 60)
+        connectType =
+            context
+                .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getInt(KEY_CONNECT_TYPE, DEFAULT_CONNECT_TYPE)
+                .coerceIn(1, 8)
+        connectTypeProbe =
+            context
+                .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_CONNECT_TYPE_PROBE, false)
         if (connectTypeProbe) {
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            context
+                .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .getString(KEY_CONNECT_TYPE_PROBE_RESULT, null)
                 ?.let { log("CARLIFE: 上次 CONNECT_TYPE 探测结论：$it") }
         }
-        orderedInit = context
-            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getBoolean(KEY_ORDERED_INIT, true)
-        settleReinit = context
-            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getBoolean(KEY_SETTLE_REINIT, false)
+        orderedInit =
+            context
+                .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_ORDERED_INIT, true)
+        settleReinit =
+            context
+                .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_SETTLE_REINIT, false)
         probeIds = context
             .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(KEY_PROBE_IDS, null)
@@ -567,10 +583,11 @@ object CarLifeHijack {
             ?.takeIf { it.isNotEmpty() }
             ?: CarLifeProtocol.FRAME_RATE_PROBE_IDS
 
-        worker = Thread({ workerLoop() }, "carlife-hijack").apply {
-            isDaemon = true
-            start()
-        }
+        worker =
+            Thread({ workerLoop() }, "carlife-hijack").apply {
+                isDaemon = true
+                start()
+            }
         startStallWatchdog()
         MediaSessionsState.addListener(mediaPlaybackListener)
         return true
@@ -589,59 +606,59 @@ object CarLifeHijack {
      * 「旧 SPS + 新参考帧」的混搭）；不带 SPS 才退回旧行为等当期 IDR。
      * 开关见 [io.github.shaonialife.carptocar.video.FirstFramePolicy]（可一键回退）。
      */
-    fun attach(videoSender: VideoSender, log: (String) -> Unit) {
-        logSink = log
-        val pending = synchronized(gopLock) {
-            val snapshot = gop.toList()
-            gop.clear()
-            gopBytes = 0
-            snapshot
-        }
-        // 缓存 SPS/PPS 只作兜底：当期/回放帧自带 SPS 会覆盖它。
-        spsPps?.let { videoSender.seedCsd(it) }
-        // attach 期间暂存进 GOP 的帧属于上一轮时间基准，一律丢弃（不回放）。
-        val late = synchronized(gopLock) {
-            val snapshot = gop.toList()
-            gop.clear()
-            gopBytes = 0
-            snapshot
-        }
-        sender = videoSender
-        screenReactivateNeeded = true
-        startFirstFrameWatchdog(videoSender)
-        val firstPending = pending.firstOrNull()
-        val replay = FirstFramePolicy.shouldReplay(
-            policyEnabled = FirstFramePolicy.useCachedGop,
-            firstFrameIsKey = firstPending?.second == true,
-            firstFrameHasSps = firstPending?.let { hasSpsNal(it.first) } == true,
-        )
-        if (replay) {
-            log(
-                "CARLIFE: 回放缓存 ${pending.size} 帧立即起播（首帧自带 SPS，" +
-                    "策略=${FirstFramePolicy.describe()}；丢弃 attach 期间 ${late.size} 帧）",
-            )
-            var pushed = 0
-            for ((frame, keyFrame) in pending) {
-                // 缓存帧本来就是旧的，不传 sourceTimestamp（避免被算成排队延迟）
-                if (videoSender.submitH264(frame, keyFrame)) pushed++ else break
+    fun attach(
+        videoSender: VideoSender,
+        log: (String) -> Unit,
+    ): Unit =
+        synchronized(videoDeliveryLock) {
+            if (!videoSender.isRunning) return@synchronized
+            logSink = log
+            val pending =
+                synchronized(gopLock) {
+                    val snapshot = gop.toList()
+                    gop.clear()
+                    gopBytes = 0
+                    snapshot
+                }
+            // 缓存 SPS/PPS 只作兜底：当期/回放帧自带 SPS 会覆盖它。
+            spsPps?.let { videoSender.seedCsd(it) }
+            sender = videoSender
+            screenReactivateNeeded = true
+            startFirstFrameWatchdog(videoSender)
+            val firstPending = pending.firstOrNull()
+            val replay =
+                FirstFramePolicy.shouldReplay(
+                    policyEnabled = FirstFramePolicy.useCachedGop,
+                    firstFrameIsKey = firstPending?.second == true,
+                    firstFrameHasSps = firstPending?.let { hasSpsNal(it.first) } == true,
+                )
+            if (replay) {
+                log(
+                    "CARLIFE: 回放缓存 ${pending.size} 帧立即起播（首帧自带 SPS，" +
+                        "策略=${FirstFramePolicy.describe()}；回放完成后再交接实时帧）",
+                )
+                var pushed = 0
+                for ((frame, keyFrame) in pending) {
+                    // 缓存帧本来就是旧的，不传 sourceTimestamp（避免被算成排队延迟）
+                    if (sender !== videoSender || !videoSender.submitH264(frame, keyFrame)) break
+                    pushed++
+                }
+                log("CARLIFE: 缓存回放已推送 $pushed/${pending.size} 帧——后续实时直通")
+            } else {
+                log(
+                    "CARLIFE: 已跳过 ${pending.size} 帧缓存——" +
+                        when {
+                            !FirstFramePolicy.useCachedGop -> "策略=等当期 IDR（可用偏好回退到立即起播）"
+                            firstPending == null -> "缓存里没有帧，等引擎当期 IDR"
+                            firstPending.second != true -> "缓存首帧不是关键帧，等当期 IDR 更安全"
+                            else -> "缓存首帧不是自带 SPS 的关键帧，等当期 IDR 更安全"
+                        },
+                )
             }
-            log("CARLIFE: 缓存回放已推送 $pushed/${pending.size} 帧——后续实时直通")
-        } else {
-            log(
-                "CARLIFE: 已跳过 ${pending.size + late.size} 帧缓存" +
-                    "（历史 GOP + attach 期间暂存）——" +
-                    when {
-                        !FirstFramePolicy.useCachedGop -> "策略=等当期 IDR（可用偏好回退到立即起播）"
-                        firstPending == null -> "缓存里没有帧，等引擎当期 IDR"
-                        firstPending.second != true -> "缓存首帧不是关键帧，等当期 IDR 更安全"
-                        else -> "缓存首帧不是自带 SPS 的关键帧，等当期 IDR 更安全"
-                    },
-            )
+            // 主动催一个带 SPS 的当期 IDR；startFirstFrameWatchdog 还有 3 秒后的兜底。
+            log("CARLIFE: 请求引擎重建编码器（约 1 秒后出当期首帧）")
+            client?.requestVideoReinit()
         }
-        // 主动催一个带 SPS 的当期 IDR；startFirstFrameWatchdog 还有 3 秒后的兜底。
-        log("CARLIFE: 请求引擎重建编码器（约 1 秒后出当期首帧）")
-        client?.requestVideoReinit()
-    }
 
     /**
      * 帧数据里有没有 SPS（NAL 类型 7）。
@@ -754,70 +771,69 @@ object CarLifeHijack {
             // 时**不能**当作「暂停」来截断——那会误丢引擎仍在推的 PCM，导致本地模拟无声。
             // 读不到状态 = 不确定，宁可不截断（放行），交由引擎侧 STOP/DATA 自行决定。
             sink.setPlaybackPaused(MediaSessionsState.nowPlaying?.playing == false)
-            val hu = CarLifeHuClient(
-                host = "127.0.0.1",
-                log = { line -> logSink?.invoke(line) },
-                onVideoFrame = { data, key, ts -> onFrame(data, key, ts) },
-                onVideoParams = { w, h, f -> logSink?.invoke("CARLIFE: 手机编码参数 ${w}x$h@$f") },
-                // SPS 是码流的真相：确认后立刻告诉上层（界面显示、落盘快照都跟着它）。
-                onStreamSize = { w, h -> onActualStreamSize?.invoke(w, h) },
-                onAudioFormat = { rate, channels -> sink.configure(rate, channels) },
-                onAudioPcm = { pcm, size -> routeAudio(sink, pcm, size) },
-                // 导航播报：TTS 通道独立格式、独立 sink，喂给同一个音频发送端
-                onTtsFormat = { rate, channels -> naviSink.configure(rate, channels) },
-                onTtsPcm = { pcm, size ->
-                    // 只记时间戳：语音会话期间它就是「助手正在对用户说话」的证据
-                    onSpeechAudio?.invoke()
-                    routeAudio(naviSink, pcm, size)
-                },
-                onAudioGate = { active -> onEngineAudioGate(active) },
-                onVoiceSession = { active -> onVoiceSession?.invoke(active) },
-                // 音频沉默看门狗判据：音乐会话确实在播 = 此刻「应该」有声，
-                // 9240 却连续零 PCM 才是异常。读不到会话（null）时按「不确定」放行不重连。
-                audioExpected = { MediaSessionsState.nowPlaying?.playing == true },
-                onMediaInfo = { info -> onMediaInfo(info) },
-                requestedFps = requestedFps,
-                initialConnectType = connectType,
-                probeIds = probeIds,
-                connectTypeProbe = connectTypeProbe,
-                orderedInit = orderedInit,
-                settleReinit = settleReinit,
-                onProbeResult = { line ->
-                    logSink?.invoke("CARLIFE: [探测] $line")
-                    appContext
-                        ?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                        ?.edit()
-                        ?.putString(KEY_CONNECT_TYPE_PROBE_RESULT, line)
-                        ?.apply()
-                },
-                // 首轮申请值 = **上次车机画布**（无缓存则引擎默认 1280×720）。
-                // 引擎只在建编码器之前认这个值，早报才能让它按车机画布编码；等 AirPlay
-                // `/info` 到了再改（setRequestedResolution）已经晚了，引擎只回一个确认值、
-                // 码流尺寸不动（2026-11-04 奥迪 3810：申请 1412×654 实编 1280×720 → 整屏黑）。
-                // 之后拿到的真实画布仍由 setRequestedResolution 覆盖并落盘。
-                initialWidth = initialCanvasW,
-                initialHeight = initialCanvasH,
-            )
+            val hu =
+                CarLifeHuClient(
+                    host = "127.0.0.1",
+                    log = { line -> logSink?.invoke(line) },
+                    onVideoFrame = { data, key, ts -> onFrame(data, key, ts) },
+                    onVideoParams = { w, h, f -> logSink?.invoke("CARLIFE: 手机编码参数 ${w}x$h@$f") },
+                    // SPS 是码流的真相：确认后立刻告诉上层（界面显示、落盘快照都跟着它）。
+                    onStreamSize = { w, h -> onActualStreamSize?.invoke(w, h) },
+                    onAudioFormat = { rate, channels -> sink.configure(rate, channels) },
+                    onAudioPcm = { pcm, size -> routeAudio(sink, pcm, size) },
+                    // 导航播报：TTS 通道独立格式、独立 sink，喂给同一个音频发送端
+                    onTtsFormat = { rate, channels -> naviSink.configure(rate, channels) },
+                    onTtsPcm = { pcm, size ->
+                        // 只记时间戳：语音会话期间它就是「助手正在对用户说话」的证据
+                        onSpeechAudio?.invoke()
+                        routeAudio(naviSink, pcm, size)
+                    },
+                    onAudioGate = { active -> onEngineAudioGate(active) },
+                    onVoiceSession = { active -> onVoiceSession?.invoke(active) },
+                    // 音频沉默看门狗判据：音乐会话确实在播 = 此刻「应该」有声，
+                    // 9240 却连续零 PCM 才是异常。读不到会话（null）时按「不确定」放行不重连。
+                    audioExpected = { MediaSessionsState.nowPlaying?.playing == true },
+                    onMediaInfo = { info -> onMediaInfo(info) },
+                    requestedFps = requestedFps,
+                    initialConnectType = connectType,
+                    probeIds = probeIds,
+                    connectTypeProbe = connectTypeProbe,
+                    orderedInit = orderedInit,
+                    settleReinit = settleReinit,
+                    onProbeResult = { line ->
+                        logSink?.invoke("CARLIFE: [探测] $line")
+                        appContext
+                            ?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                            ?.edit()
+                            ?.putString(KEY_CONNECT_TYPE_PROBE_RESULT, line)
+                            ?.apply()
+                    },
+                    // 首轮申请值 = **上次车机画布**（无缓存则引擎默认 1280×720）。
+                    // 引擎只在建编码器之前认这个值，早报才能让它按车机画布编码；等 AirPlay
+                    // `/info` 到了再改（setRequestedResolution）已经晚了，引擎只回一个确认值、
+                    // 码流尺寸不动（2026-11-04 奥迪 3810：申请 1412×654 实编 1280×720 → 整屏黑）。
+                    // 之后拿到的真实画布仍由 setRequestedResolution 覆盖并落盘。
+                    initialWidth = initialCanvasW,
+                    initialHeight = initialCanvasH,
+                )
+            // start() 在握手返回前就会拉起视频读线程：必须先用旧会话栅栏通知解码状态复位，
+            // 避免新读线程先送出首帧 IDR 后再被复位冲掉。
+            synchronized(videoDeliveryLock) {
+                sender?.let { target ->
+                    screenReactivateNeeded = true
+                    target.onSourceRestart("CarLife 会话重建（引擎重连）")
+                }
+            }
             if (hu.start()) {
                 client = hu
-                // SETUP 先于 client 创建的边界（requestedW/H 已缓存车机画布）：把它回放为
-                // 「申请值」，让引擎尝试按车机画布编码；确认值（videoWidth）仍由引擎回显，
-                // 不受影响。
                 if (requestedW > 0 && requestedH > 0) {
                     hu.setRequestedResolution(requestedW, requestedH)
                 }
-                // 会话建立前缓存过 SPS：立刻用它校准触摸基准，别等下一帧关键帧。
                 spsPps?.let { hu.seedSps(it) }
-                // CarPlay 会话仍在、CarLife 换了一轮（引擎掉线重连 / 用户重开「无线连接」）：
-                // 车机手里的 avcC 与参考帧都是上一轮的，必须让视频层重发 VideoConfig、
-                // 并等到新 IDR 再送帧，否则「CarPlay 不掉、CarLife 重连后永久没画面」
-                // （2026-10-25 用户实测）。首次劫持时 sender 还是 null，这里是空操作。
                 if (sender != null) {
-                    screenReactivateNeeded = true
-                    sender?.onSourceRestart("CarLife 会话重建（引擎重连）")
                     startSourceRestartWatchdog(hu)
                 }
-                logSink?.invoke("CARLIFE: 劫持成功，已接管本机 CarLife 码流（等待连接车机）")
+                logSink?.invoke("CARLIFE: 协议握手完成，等待真实源首帧（不等于已收到 CarLife 码流）")
             } else {
                 logSink?.invoke("CARLIFE: 握手失败，2 秒后重试（确认 CarLife 停在「正在连接」）")
             }
@@ -962,8 +978,7 @@ object CarLifeHijack {
     }
 
     /** 距上一次收到 CarLife 视频帧过去多少毫秒；-1 = 本轮还一帧都没收到。 */
-    private fun frameAgeMs(now: Long): Long =
-        if (lastSourceFrameAt <= 0L) -1L else (now - lastSourceFrameAt).coerceAtLeast(0L)
+    private fun frameAgeMs(now: Long): Long = if (lastSourceFrameAt <= 0L) -1L else (now - lastSourceFrameAt).coerceAtLeast(0L)
 
     /**
      * 停摆时的手机屏幕状态（写进日志，用来区分「手机侧画面被占用」与「链路/引擎问题」）。
@@ -989,50 +1004,49 @@ object CarLifeHijack {
         data: ByteArray,
         keyFrame: Boolean,
         sourceTimestampMs: Long,
-    ) {
-        recvWindowFrames++
-        recvWindowBytes += data.size
-        if (keyFrame) recvWindowKeys++
-        // 停摆检测的打卡点（来电时引擎会整段不出帧，只能靠这里判断「是源没画面」还是链路断）
-        val now = android.os.SystemClock.uptimeMillis()
-        lastSourceFrameAt = now
-        frameSeq++
-        val stalledSince = stallSince
-        if (stalledSince > 0) {
-            stallSince = 0
-            logSink?.invoke("CARLIFE: 画面源恢复（停摆 ${(now - stalledSince) / 1000} 秒）")
-        }
-        if (!hasVideo && data.isNotEmpty()) {
-            hasVideo = true
-            // 独立于一会话：还没连车机时也要能看出「CarLife 到底在不在推流」。
-            // 排查编码器被配置搞挂时，这是唯一的直接证据。
-            logSink?.invoke("CARLIFE: ✓ 收到 CarLife 首帧（${data.size}B，keyFrame=$keyFrame）")
-        }
-        rememberSpsPps(data)
-        val frame = ensureSpsPps(data)
-        val target = sender
-        if (target != null) {
-            if (target.submitH264(frame, keyFrame, sourceTimestampMs)) {
-                noteDelivered(frame.size)
-                maybeReactivateScreen()
+    ): Unit =
+        synchronized(videoDeliveryLock) delivery@{
+            recvWindowFrames++
+            recvWindowBytes += data.size
+            if (keyFrame) recvWindowKeys++
+            // 停摆检测的打卡点（来电时引擎会整段不出帧，只能靠这里判断「是源没画面」还是链路断）
+            val now = android.os.SystemClock.uptimeMillis()
+            lastSourceFrameAt = now
+            frameSeq++
+            val stalledSince = stallSince
+            if (stalledSince > 0) {
+                stallSince = 0
+                logSink?.invoke("CARLIFE: 画面源恢复（停摆 ${(now - stalledSince) / 1000} 秒）")
             }
-            return
-        }
-        synchronized(gopLock) {
-            if (keyFrame) {
-                gop.clear()
-                gopBytes = 0
-            } else if (gop.isEmpty()) {
-                return // 没有关键帧打头，非关键帧单独送过去也解不出画面
+            if (!hasVideo && data.isNotEmpty()) {
+                hasVideo = true
+                logSink?.invoke("CARLIFE: ✓ 收到 CarLife 首帧（${data.size}B，keyFrame=$keyFrame）")
             }
-            gop.addLast(frame to keyFrame)
-            gopBytes += frame.size
-            while (gop.size > MAX_GOP_FRAMES || gopBytes > MAX_GOP_BYTES) {
-                val removed = gop.removeFirstOrNull() ?: break
-                gopBytes -= removed.first.size
+            rememberSpsPps(data)
+            val frame = ensureSpsPps(data)
+            val target = sender
+            if (target != null) {
+                if (target.submitH264(frame, keyFrame, sourceTimestampMs)) {
+                    noteDelivered(frame.size)
+                    maybeReactivateScreen()
+                }
+                return@delivery
+            }
+            synchronized(gopLock) {
+                if (keyFrame) {
+                    gop.clear()
+                    gopBytes = 0
+                } else if (gop.isEmpty()) {
+                    return@delivery
+                }
+                gop.addLast(frame to keyFrame)
+                gopBytes += frame.size
+                while (gop.size > MAX_GOP_FRAMES || gopBytes > MAX_GOP_BYTES) {
+                    val removed = gop.removeFirstOrNull() ?: break
+                    gopBytes -= removed.first.size
+                }
             }
         }
-    }
 
     /** AnnexB 起始码长度（3 或 4），非起始码返回 0。 */
     private fun startCodeLen(
@@ -1040,9 +1054,14 @@ object CarLifeHijack {
         index: Int,
     ): Int =
         when {
-            index + 4 <= data.size && data[index] == 0.toByte() && data[index + 1] == 0.toByte() &&
-                data[index + 2] == 0.toByte() && data[index + 3] == 1.toByte() -> 4
-            index + 3 <= data.size && data[index] == 0.toByte() && data[index + 1] == 0.toByte() &&
+            index + 4 <= data.size &&
+                data[index] == 0.toByte() &&
+                data[index + 1] == 0.toByte() &&
+                data[index + 2] == 0.toByte() &&
+                data[index + 3] == 1.toByte() -> 4
+            index + 3 <= data.size &&
+                data[index] == 0.toByte() &&
+                data[index + 1] == 0.toByte() &&
                 data[index + 2] == 1.toByte() -> 3
             else -> 0
         }
@@ -1131,11 +1150,12 @@ object CarLifeHijack {
                 fps,
                 bps / 1_000_000f,
                 deliverWindowBytes / deliverWindowFrames.coerceAtLeast(1) / 1024,
-            ) + " ｜ 收到 %d 帧 / I 帧 %d 个 · %.2f Mbps".format(
-                recvWindowFrames,
-                recvWindowKeys,
-                recvWindowBytes * 8_000L / elapsed / 1_000_000f,
-            ),
+            ) +
+                " ｜ 收到 %d 帧 / I 帧 %d 个 · %.2f Mbps".format(
+                    recvWindowFrames,
+                    recvWindowKeys,
+                    recvWindowBytes * 8_000L / elapsed / 1_000_000f,
+                ),
         )
         deliverWindowStart = now
         deliverWindowFrames = 0
@@ -1178,7 +1198,7 @@ object CarLifeHijack {
         requestedH = height
         if (CarCanvasMemory.remember(appContext, width, height)) {
             logSink?.invoke(
-                "CARLIFE: 已记住车机画布 ${width}×${height}（下次开机首轮 98311 就按它申请）" +
+                "CARLIFE: 已记住车机画布 $width×$height（下次开机首轮 98311 就按它申请）" +
                     "——引擎只在建编码器前认这个值：想让当前这轮也生效，" +
                     "请强制停止 CarLife+ 后重开、再连一次",
             )
@@ -1197,7 +1217,9 @@ object CarLifeHijack {
         pcm: ByteArray,
         size: Int,
     ) {
-        val routed = io.github.shaonialife.carptocar.SessionController.audioSender?.isRunning == true
+        val routed =
+            io.github.shaonialife.carptocar.SessionController.audioSender
+                ?.isRunning == true
         if (routed) {
             sink.write(0, 0, pcm, size)
             return
@@ -1316,10 +1338,11 @@ object CarLifeHijack {
             touchPressed -> {
                 // 短促且几乎没有位移 = 点击：用按下点收尾，避免车机端把轻微抖动
                 // 当拖动、或把抬起坐标算到相邻控件上。双指手势不算点击。
-                val isTap = !multiActive &&
-                    now - tapStartedAt <= TAP_MAX_MS &&
-                    kotlin.math.abs(tx - downX) <= TAP_MAX_DRIFT_PX &&
-                    kotlin.math.abs(ty - downY) <= TAP_MAX_DRIFT_PX
+                val isTap =
+                    !multiActive &&
+                        now - tapStartedAt <= TAP_MAX_MS &&
+                        kotlin.math.abs(tx - downX) <= TAP_MAX_DRIFT_PX &&
+                        kotlin.math.abs(ty - downY) <= TAP_MAX_DRIFT_PX
                 finishGesture(
                     hu,
                     if (isTap) downX else tx,
@@ -1336,7 +1359,7 @@ object CarLifeHijack {
         if (touchCount % 200 == 0) {
             logSink?.invoke(
                 "CARLIFE: 触控累计 $touchCount 条（已写入通道 ${hu.sentTouchCount} 条，" +
-                    "坐标观测上限 ${observedMaxX}x${observedMaxY}，视图 ${viewW}x$viewH）",
+                    "坐标观测上限 ${observedMaxX}x$observedMaxY，视图 ${viewW}x$viewH）",
             )
         }
         return true
@@ -1393,7 +1416,7 @@ object CarLifeHijack {
         multiMoves++
         hu.touchAction(act.MOVE, tx, ty)
         if (multiMoves <= 5 || multiMoves % 20 == 0) {
-            logSink?.invoke("CARLIFE: 多指 移动2 ($tx,$ty) MOVE#${multiMoves}")
+            logSink?.invoke("CARLIFE: 多指 移动2 ($tx,$ty) MOVE#$multiMoves")
         }
     }
 
@@ -1420,7 +1443,7 @@ object CarLifeHijack {
             }
             hu.touchAction(act.UP, ux, uy)
             logSink?.invoke(
-                "CARLIFE: 双指手势结束（手指 2 移动 ${multiMoves} 次）→ 复合通道 UP" +
+                "CARLIFE: 双指手势结束（手指 2 移动 $multiMoves 次）→ 复合通道 UP" +
                     (if (abnormal != null) " · $abnormal" else ""),
             )
             multiActive = false
@@ -1466,14 +1489,15 @@ object CarLifeHijack {
      */
     private const val ENGINE_RESYNC_MIN_GAP_MS = 2_000L
 
-    private fun portListening(port: Int): Boolean = try {
-        Socket().use { socket ->
-            socket.connect(InetSocketAddress("127.0.0.1", port), 800)
-            true
+    private fun portListening(port: Int): Boolean =
+        try {
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress("127.0.0.1", port), 800)
+                true
+            }
+        } catch (error: Exception) {
+            false
         }
-    } catch (error: Exception) {
-        false
-    }
 
     private fun sleep(ms: Long) {
         try {
