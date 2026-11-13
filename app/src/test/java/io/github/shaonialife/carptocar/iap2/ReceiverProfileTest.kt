@@ -86,6 +86,48 @@ class ReceiverProfileTest {
     }
 
     @Test
+    fun fullMediaListsWithoutWirelessCarPlayIdsStayUnknown() {
+        val profile =
+            ReceiverProfile.classify(
+                ReceiverProfile.Signals(
+                    sendIds =
+                        setOf(
+                            0x5000,
+                            0x5002,
+                            0x5003,
+                            0x6800,
+                            0x6802,
+                            0x6803,
+                            0x4c00,
+                            0x4c02,
+                            0x4c03,
+                            0x4c05,
+                            0x4c07,
+                            0xae00,
+                            0xae02,
+                            0xea03,
+                        ),
+                    receiveIds =
+                        setOf(
+                            0x4e09,
+                            0x4e0a,
+                            0x4e0b,
+                            0x4e0c,
+                            0x5001,
+                            0x6801,
+                            0x4c01,
+                            0x4c04,
+                            0x4e0d,
+                            0xae01,
+                            0xea00,
+                            0xea01,
+                        ),
+                ),
+            )
+        assertEquals(ReceiverProfile.WifiGen.UNKNOWN, profile.wifiGen)
+    }
+
+    @Test
     fun sparseSendListAloneStaysUnknown() {
         // 单份稀疏清单（2 项）无 0x5703：不判「新」——奥迪的反例证明稀疏清单
         // 不列 0x57xx 也可以走旧协议
@@ -191,8 +233,9 @@ class ReceiverProfileTest {
         val legacy =
             ReceiverProfile.classify(
                 ReceiverProfile.Signals(
-                    features = (AirPlayFeatures.parse("0x44540380,0x61") ?: 0L) and
-                        AirPlayFeatures.HK_PAIRING_AND_ENCRYPT.inv(),
+                    features =
+                        (AirPlayFeatures.parse("0x44540380,0x61") ?: 0L) and
+                            AirPlayFeatures.HK_PAIRING_AND_ENCRYPT.inv(),
                     sendIds = setOf(0x5703),
                 ),
             )
