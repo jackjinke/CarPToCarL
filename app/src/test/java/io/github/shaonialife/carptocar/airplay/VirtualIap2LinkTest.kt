@@ -1,5 +1,6 @@
 package io.github.shaonialife.carptocar.airplay
 
+import io.github.shaonialife.carptocar.iap2.AccessoryDeclaration
 import io.github.shaonialife.carptocar.iap2.CarPlayNowPlaying
 import io.github.shaonialife.carptocar.iap2.Iap2Csm
 import io.github.shaonialife.carptocar.iap2.Iap2LinkEngine
@@ -268,6 +269,43 @@ class VirtualIap2LinkTest {
         assertEquals(listOf(0x4158), h.carSends(0x4157))
         assertEquals(listOf(0x4155), h.carSends(0x4154))
         assertEquals(listOf(0x4171), h.carSends(0x4170))
+    }
+
+    @Test
+    fun postAuthDeviceStateUsesNulTerminatedUtf8AndNegotiatedAccessoryLanguage() {
+        AccessoryDeclaration.reset()
+        try {
+            val h = Harness()
+            h.link.armMib3()
+            h.car.start(0)
+            h.exchangeUntilNormal()
+
+            // 模拟车机在 0x1D01 参数 12 声明当前语言为 en（仅支持 en/de，不支持硬编码 zh）
+            h.carSends(
+                0x1D01,
+                Iap2Csm.string(0, "CarPlay_HU") +
+                    Iap2Csm.string(1, "HU_GEN2") +
+                    Iap2Csm.string(12, "en"),
+            )
+            h.carSends(0xAA01, Iap2Csm.param(0, ByteArray(608)))
+            val burstFrom = h.controlFrames().size
+            h.carSends(0xAA03, Iap2Csm.param(0, ByteArray(68)))
+            h.settle()
+
+            val burst = h.controlFrames().drop(burstFrom)
+            assertEquals(listOf(0xAA05, 0x4E0C, 0x4E0A, 0x4E0B, 0x4E09), burst.map { it.second })
+
+            for (msgId in listOf(0x4E0C, 0x4E0A, 0x4E09)) {
+                val raw = h.lastRawFrameOf(msgId)!!
+                val param0 = Iap2Csm.parseParams(raw.copyOfRange(6, raw.size)).first { it.id == 0 }.value
+                assertTrue("0x${msgId.toString(16)} UTF-8 参数必须以 NUL 结尾", param0.isNotEmpty() && param0.last() == 0.toByte())
+            }
+            val langRaw = h.lastRawFrameOf(0x4E0A)!!
+            val langBytes = Iap2Csm.parseParams(langRaw.copyOfRange(6, langRaw.size)).first { it.id == 0 }.value
+            assertEquals(listOf('e'.code.toByte(), 'n'.code.toByte(), 0.toByte()), langBytes.toList())
+        } finally {
+            AccessoryDeclaration.reset()
+        }
     }
 
     @Test
