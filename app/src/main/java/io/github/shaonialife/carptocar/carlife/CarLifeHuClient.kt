@@ -184,11 +184,18 @@ class CarLifeHuClient(
      * 让引擎在「已有编码器」的状态下重建一次。只做一次，避免把引擎打进反复重建。
      */
     private val settleReinit: Boolean = true,
+    private val monotonicMillis: () -> Long = { android.os.SystemClock.uptimeMillis() },
+    private val connectSocket: ((Int) -> Socket)? = null,
 ) {
     private val running = AtomicBoolean(false)
     private val sockets = ConcurrentHashMap<Int, Socket>()
     private var cmdOut: OutputStream? = null
+
+    @Volatile
     private var touchOut: OutputStream? = null
+
+    @Volatile
+    private var lastTouchReconnectAt = 0L
 
     /**
      * 低频诊断日志的限流。
@@ -477,14 +484,10 @@ class CarLifeHuClient(
         if (running.get()) return true
         log("CARLIFE: 连接本机车机端口 $host …")
         for (port in PORTS) {
-            val socket = Socket()
             try {
-                socket.tcpNoDelay = true
-                socket.connect(InetSocketAddress(host, port), connectTimeoutMs)
-                sockets[port] = socket
+                sockets[port] = openPortSocket(port)
             } catch (error: Exception) {
                 log("CARLIFE: 端口 $port 连接失败 - ${error.message}")
-                runCatching { socket.close() }
             }
         }
         val cmd = sockets[CarLifeProtocol.PORT_CMD]
@@ -496,7 +499,7 @@ class CarLifeHuClient(
         cmdOut = cmd.getOutputStream()
         touchOut = sockets[CarLifeProtocol.PORT_TOUCH]?.getOutputStream()
         running.set(true)
-        lastFrameAt = android.os.SystemClock.uptimeMillis()
+        lastFrameAt = monotonicMillis()
         // 首轮有序初始化的闸门：每条新会话都要从「98386 还没确认、首条 98311 还没发」开始。
         firstInitSent = false
         featureConfigAcked = false
@@ -513,7 +516,7 @@ class CarLifeHuClient(
                     probeQueue.joinToString(",") + "）",
             )
         }
-        if (touchOut != null) startTouchWorker()
+        startTouchWorker()
 
         startReader("carlife-cmd") { cmdReader(cmd.getInputStream()) }
         sockets[CarLifeProtocol.PORT_VIDEO]?.let { video ->
@@ -607,7 +610,7 @@ class CarLifeHuClient(
         y: Int,
         action: Int = -1,
     ) {
-        if (touchOut == null) return
+        if (!running.get()) return
         // 只做安全范围约束，**不按视频分辨率（SPS/协商档位）钳位**：
         // 触摸坐标的域是「车机 display 坐标」，引擎自己乘 getTouchXOffset() 换算到手机屏。
         // 以前按 videoSize 钳位，码流 1280×720 而车机画布 1412×654 时，右侧 132 像素
@@ -682,7 +685,6 @@ class CarLifeHuClient(
         y: Int,
         action: Int,
     ) {
-        val out = touchOut ?: return
         val px = x.coerceIn(0, TOUCH_COORD_MAX)
         val py = y.coerceIn(0, TOUCH_COORD_MAX)
         // 复合动作（0x68001）的负载是 CarlifeTouchAction{action,x,y}，
@@ -695,15 +697,67 @@ class CarLifeHuClient(
             }
         val frame = CarLifeProtocol.packCommand(serviceType, payload)
         sentTouchCount++
-        if (!runCatching {
-                out.write(frame)
-                out.flush()
-            }.isSuccess
-        ) {
-            touchWriteFailures++
-            if (touchWriteFailures == 1 || touchWriteFailures % 50 == 0) {
-                log("CARLIFE: 触摸写入失败 $touchWriteFailures 次（通道可能已断）")
+        val current = touchOut ?: reopenTouch()
+        if (current != null && writeTouchBytes(current, frame)) return
+        val reopened = reopenTouch(force = true)
+        if (reopened != null && writeTouchBytes(reopened, frame)) return
+        touchWriteFailures++
+        if (touchWriteFailures == 1 || touchWriteFailures % 50 == 0) {
+            log("CARLIFE: 触摸写入失败 $touchWriteFailures 次（通道可能已断）")
+        }
+    }
+
+    private fun openPortSocket(port: Int): Socket {
+        val custom = connectSocket
+        if (custom != null) return custom(port)
+        val socket = Socket()
+        try {
+            socket.tcpNoDelay = true
+            socket.connect(InetSocketAddress(host, port), connectTimeoutMs)
+            return socket
+        } catch (error: Exception) {
+            runCatching { socket.close() }
+            throw error
+        }
+    }
+
+    private fun writeTouchBytes(
+        out: OutputStream,
+        frame: ByteArray,
+    ): Boolean =
+        runCatching {
+            out.write(frame)
+            out.flush()
+        }.onFailure {
+            if (touchOut === out) touchOut = null
+            runCatching { sockets.remove(CarLifeProtocol.PORT_TOUCH)?.close() }
+        }.isSuccess
+
+    private fun reopenTouch(force: Boolean = false): OutputStream? {
+        if (!running.get()) return null
+        val now = monotonicMillis()
+        if (!force && lastTouchReconnectAt != 0L && now - lastTouchReconnectAt < TOUCH_RECONNECT_COOLDOWN_MS) {
+            return null
+        }
+        if (force && lastTouchReconnectAt != 0L && now - lastTouchReconnectAt < TOUCH_FORCE_RETRY_MIN_MS) {
+            return null
+        }
+        lastTouchReconnectAt = now
+        runCatching { sockets.remove(CarLifeProtocol.PORT_TOUCH)?.close() }
+        return try {
+            val socket = openPortSocket(CarLifeProtocol.PORT_TOUCH)
+            if (!running.get()) {
+                runCatching { socket.close() }
+                return null
             }
+            val out = socket.getOutputStream()
+            sockets[CarLifeProtocol.PORT_TOUCH] = socket
+            touchOut = out
+            log("CARLIFE: 触控通道已重连（${CarLifeProtocol.PORT_TOUCH}）")
+            out
+        } catch (_: Exception) {
+            touchOut = null
+            null
         }
     }
 
@@ -1735,8 +1789,24 @@ class CarLifeHuClient(
         }
     }
 
+    /** 音乐暂停/恢复切换时刷新沉默计时，避免长时间静音后解除静音瞬间误判超时重连 9240。 */
+    fun noteMediaExpectationChanged() {
+        val now = monotonicMillis()
+        mediaChan.lastPcmAt = now
+        mediaChan.silentReopens = 0
+        mediaChan.nextSilentAt = 0L
+    }
+
+    internal fun notifyVideoFrameForTest() {
+        lastFrameAt = monotonicMillis()
+    }
+
+    internal fun superviseMediaOnceForTest() {
+        superviseAudio(mediaChan)
+    }
+
     private fun superviseAudio(channel: AudioChannel) {
-        val now = android.os.SystemClock.uptimeMillis()
+        val now = monotonicMillis()
         val socket = sockets[channel.port]
         if (socket == null || socket.isClosed || channel.dead) {
             // 断链重连：不设次数上限（引擎冷启动期可能连续 reset，重连成功才停）
@@ -1751,6 +1821,14 @@ class CarLifeHuClient(
         }
         // TTS 只做断链重连：没开导航时它本来就该长时间静默，按沉默判会天天误重连。
         if (channel.isTts) return
+        // 「确实该有声音」：引擎刚发过 0x30004，或上层确认音乐会话正在播放。
+        // 暂停/静音期间本来就没有 PCM，持续刷新基线，避免恢复播放瞬间被累计静音时长误触发重连。
+        if (!engineAudioActive && !audioExpected()) {
+            channel.lastPcmAt = now
+            channel.silentReopens = 0
+            channel.nextSilentAt = 0L
+            return
+        }
         val silentFor = now - channel.lastPcmAt
         if (silentFor < SILENT_RECONNECT_MS) return
         // 刚（重新）接上的宽限期：给引擎一点时间把流推起来。
@@ -1758,8 +1836,6 @@ class CarLifeHuClient(
         // 画面还在出帧 = 引擎活着，问题只在这条音频流上。视频也停了说明整条链路有事，
         // 那是会话冻结/断链恢复的活，这里跟着重连只会把水搅浑。
         if (now - lastFrameAt > VIDEO_ALIVE_MS) return
-        // 「确实该有声音」：引擎刚发过 0x30002，或上层确认音乐会话正在播放。
-        if (!engineAudioActive && !audioExpected()) return
         if (now < channel.nextSilentAt) return
         if (channel.silentReopens >= SILENT_MAX_ATTEMPTS) {
             if (channel.nextSilentAt != Long.MAX_VALUE) {
@@ -1785,7 +1861,7 @@ class CarLifeHuClient(
 
     /** 收到 PCM 的打卡点：刷新沉默计时，顺带报告「恢复」。 */
     private fun noteAudioPcm(channel: AudioChannel) {
-        val now = android.os.SystemClock.uptimeMillis()
+        val now = monotonicMillis()
         val previous = channel.lastPcmAt
         channel.lastPcmAt = now
         val reopens = channel.silentReopens
@@ -1834,7 +1910,7 @@ class CarLifeHuClient(
                 channel.dead = true
                 return
             }
-        val now = android.os.SystemClock.uptimeMillis()
+        val now = monotonicMillis()
         channel.dead = false
         channel.openedAt = now
         channel.lastPcmAt = now
@@ -1846,10 +1922,8 @@ class CarLifeHuClient(
     /** 重连音频通道（9240 / 9241）。成功返回 true（已挂上新的读线程）。 */
     private fun reopenAudio(channel: AudioChannel): Boolean {
         runCatching { sockets.remove(channel.port)?.close() }
-        val socket = Socket()
         return try {
-            socket.tcpNoDelay = true
-            socket.connect(InetSocketAddress(host, channel.port), connectTimeoutMs)
+            val socket = openPortSocket(channel.port)
             if (!running.get()) {
                 runCatching { socket.close() }
                 return false
@@ -1857,8 +1931,7 @@ class CarLifeHuClient(
             sockets[channel.port] = socket
             openAudio(channel, socket)
             true
-        } catch (error: Exception) {
-            runCatching { socket.close() }
+        } catch (_: Exception) {
             false
         }
     }
@@ -2124,6 +2197,8 @@ class CarLifeHuClient(
 
         /** 「视频仍在正常出帧」的窗口（毫秒）；超过它说明整条链路都有事，不该只怪音频。 */
         private const val VIDEO_ALIVE_MS = 3_000L
+        private const val TOUCH_RECONNECT_COOLDOWN_MS = 1_000L
+        private const val TOUCH_FORCE_RETRY_MIN_MS = 200L
 
         private val PORTS =
             intArrayOf(

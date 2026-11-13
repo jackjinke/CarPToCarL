@@ -71,8 +71,7 @@ internal class CarLifeMediaPlayback {
             CarLifeMediaActivity.PAUSE -> {
                 sourcePaused = true
                 wirePlaying = false
-                eligible = false
-                initialized = false
+                if (focused == true) eligible = false
                 pcmAfterInit = false
             }
 
@@ -84,6 +83,7 @@ internal class CarLifeMediaPlayback {
 
             CarLifeMediaActivity.FOCUS_GAINED -> {
                 if (focused != true) {
+                    eligible = true
                     pcmAfterInit = false
                     if (sessionPlaying != false) sourcePaused = false
                 }
@@ -113,7 +113,6 @@ internal class CarLifeMediaPlayback {
         sourcePaused = true
         wirePlaying = false
         eligible = false
-        initialized = false
         pcmAfterInit = false
     }
 
