@@ -41,7 +41,7 @@ class Iap2BluetoothClient(
     /** 「正在播放」信息提供者（歌名/歌手/专辑，见 [Iap2SenderSession]）。 */
     private val nowPlayingProvider: (() -> CarPlayNowPlaying?)? = null,
     /** 保活泵退出（BT 链路断开）时回调：主控据此释放「会话处理中」（僵尸轮次堵门修复）。 */
-    private val onLinkClosed: () -> Unit = {},
+    private val onLinkClosed: (() -> Boolean) -> Unit = {},
 ) {
     companion object {
         /**
@@ -130,21 +130,17 @@ class Iap2BluetoothClient(
         java.util.concurrent.atomic
             .AtomicLong(0)
 
+    private val channelLock: Any = this
+
+    private fun ownsChannel(channel: Iap2LinkChannel): Boolean =
+        activeChannel === channel && BtSessionGate.ownsControl(channel) && !channel.closedLocally
+
     @Volatile
     private var activeChannel: Iap2LinkChannel? = null
 
     /** 当前保活阶段的发送端会话（bring-up 完成后由 runSenderSession 回填）。 */
     @Volatile
     private var senderSession: Iap2SenderSession? = null
-
-    /**
-     * 本轮会话是**我们自己主动拆的**（[detachCurrentSession]）。
-     *
-     * 收尾时用来区分两种「会话结束」：主动拆（不要补连）与掉线（CarPlay 期间要补连，
-     * 见 [BtSessionGate.noteLinkLost]）。
-     */
-    @Volatile
-    private var manualTeardown = false
 
     @Volatile
     private var running = false
@@ -159,8 +155,7 @@ class Iap2BluetoothClient(
      *
      * 返回 false = 当前没有可用的发送端会话（链路已断/还没起来），调用方只能退而重公告 ctrl。
      */
-    fun nudgeCarPlayAvailability(reason: String): Boolean =
-        senderSession?.nudgeCarPlayAvailability(reason) ?: false
+    fun nudgeCarPlayAvailability(reason: String): Boolean = senderSession?.nudgeCarPlayAvailability(reason) ?: false
 
     /** 目标设备不在已配对列表的提示节流（避免每 3 秒刷屏）。 */
     private var lastTargetMissingLogAt = 0L
@@ -298,6 +293,7 @@ class Iap2BluetoothClient(
         ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) ==
             PackageManager.PERMISSION_GRANTED
 
+    @Synchronized
     fun start(): Boolean {
         if (running) return true
         if (!hasPermission()) {
@@ -318,6 +314,7 @@ class Iap2BluetoothClient(
         iap2ServiceCache.clear()
         skippedNoService.clear()
         BtSessionGate.targetSoftFallback = false
+        BtSessionGate.clearRemoteDisconnectGrace()
         // 用户主动「启动连接」= 给车机端健康判定一次干净的重来机会（可能刚重启过车机）。
         CarPlayUplinkHealth.reset()
         running = true
@@ -349,8 +346,10 @@ class Iap2BluetoothClient(
             } ?: return
         var lastFailureLogAt = 0L
         var targetFailRounds = 0
+
         /** 连续「SDP 层失败」的轮数（见 [PASSIVE_FALLBACK_ROUNDS]）。 */
         var passiveFailRounds = 0
+
         /** 连续「没有有效会话」的轮数，用于 [RETRY_BACKOFF_MILLIS] 退避（连上即断也算）。 */
         var failStreak = 0
         while (running && generation.get() == myGeneration) {
@@ -373,6 +372,15 @@ class Iap2BluetoothClient(
                         "（早了它只重开旧会话：给热点凭据，但不启动 AirPlay）",
                 )
                 sleepQuietly(cooldownLeft + 200)
+                continue
+            }
+            val passiveLeft = BtSessionGate.passiveGraceRemainingMillis()
+            if (passiveLeft > 0) {
+                log(
+                    "BT-C: 对端刚断开会话——先被动等待 ${(passiveLeft + 999) / 1000} 秒让车机主动回连" +
+                        "（避免出站拨号与车机回连发生双向 RFCOMM 碰撞）",
+                )
+                sleepPassiveGrace(passiveLeft, myGeneration)
                 continue
             }
             // 静默降噪（2026-10-10 用户实测后启用）——会话期间完全静默，不产生任何连接尝试/日志：
@@ -583,7 +591,7 @@ class Iap2BluetoothClient(
                 return
             }
             val sessionStartedAt = android.os.SystemClock.uptimeMillis()
-            runSession(connected)
+            runSession(connected, myGeneration)
             // 「连上就被关」不算成功：2026-10-28 大众实测 52 轮全是「连入 → 0.5 秒被车机
             // 关闭」（车机不在无线窗口/要自己发起）。这类轮次按失败计，否则退避永远回到 3 秒，
             // 每轮白断一次车机、还可能抢掉它主动连入的时机。
@@ -722,14 +730,26 @@ class Iap2BluetoothClient(
         }
     }
 
-    private fun runSession(socket: BluetoothSocket) {
+    private fun runSession(
+        socket: BluetoothSocket,
+        myGeneration: Long,
+    ) {
         val stream =
             StreamDuplexStream(socket.inputStream, socket.outputStream) {
                 runCatching { socket.close() }
             }
         val channel = Iap2LinkChannel(stream, name = "iap2-bt-car") { line -> log(line) }
-        activeChannel = channel
-        manualTeardown = false
+        val previous =
+            synchronized(channelLock) {
+                if (!running || generation.get() != myGeneration) {
+                    channel.close()
+                    return
+                }
+                activeChannel = channel
+                senderSession = null
+                BtSessionGate.claimControl(channel, inbound = false)
+            }
+        previous?.close()
         val peerAddress =
             try {
                 socket.remoteDevice.address
@@ -743,35 +763,47 @@ class Iap2BluetoothClient(
                 context,
                 SESSION_TIMEOUT_MILLIS,
                 log,
-                onEndpoint,
-                onWifiCredentials,
-                onEndpointUpdate,
-                nowPlayingProvider,
+                onEndpoint = { if (ownsChannel(channel)) onEndpoint(it) },
+                onWifiCredentials = { if (ownsChannel(channel)) onWifiCredentials(it) },
+                onEndpointUpdate = { if (ownsChannel(channel)) onEndpointUpdate(it) },
+                nowPlayingProvider = nowPlayingProvider,
                 onSessionReady = { session ->
-                    senderSession = session
-                    BtSessionGate.iap2Ready = true
+                    synchronized(channelLock) {
+                        if (ownsChannel(channel)) {
+                            senderSession = session
+                            BtSessionGate.markControlReady(channel)
+                        }
+                    }
                 },
-                onLinkClosed = onLinkClosed,
+                onLinkClosed = {
+                    onLinkClosed { running && ownsChannel(channel) }
+                },
             )
         } catch (error: IOException) {
             log("BT-C: SESSION 失败 - ${error.message}")
         } finally {
-            // 先读「本轮拿到过 0x4301 没有」，再清 senderSession——它是判定车机端 CarPlay
-            // 是否已退出的唯一正面证据（见 CarPlayUplinkHealth）。
-            val gotStartSession = senderSession?.startSessionReceived == true
-            activeChannel = null
-            senderSession = null
-            BtSessionGate.iap2Ready = false
-            currentSocket.getAndSet(null)?.let { runCatching { it.close() } }
+            val remoteLoss = !channel.closedLocally
+            var gotStartSession = false
+            val owned =
+                synchronized(channelLock) {
+                    if (activeChannel === channel) {
+                        gotStartSession = senderSession?.startSessionReceived == true
+                        activeChannel = null
+                        senderSession = null
+                        BtSessionGate.releaseControl(channel)
+                    } else {
+                        false
+                    }
+                }
+            currentSocket.compareAndSet(socket, null)
             runCatching { socket.close() }
             channel.close()
             log("BT-C: 本轮会话结束（客户端仍在运行，将自动重连）")
-            // 只统计「本轮到死都没拿到 0x4301 且是自然结束」的轮次：用户主动停止、或为换链路
-            // 而退役控制会话，都不是车机的态度，计进去会让「连续两轮」变得廉价。
-            // 成功那条路已在会话内 noteStartSession() 清零，这里不必重复。
-            if (!gotStartSession &&
-                !manualTeardown &&
+            if (owned &&
+                remoteLoss &&
+                !gotStartSession &&
                 running &&
+                generation.get() == myGeneration &&
                 CarPlayUplinkHealth.finishRound(gotStartSession = false)
             ) {
                 log(
@@ -782,11 +814,7 @@ class Iap2BluetoothClient(
                         "请**重启车机**（或熄火重上电）后再试；车机恢复后本机会自动接上。",
                 )
             }
-            // CarPlay 还在跑、又不是我们主动拆的 → 这不是「本轮结束」，是控制链路掉线。
-            // 主循环的静音闸门（sessionActive）会把重连一起挡掉，所以必须显式登记，
-            // 让出站循环对**这一台**单独补连（2026-11-04 奥迪 MIB3 实车：
-            // 三轮会话全在 `packet 115 not acknowledged` 后再也没人重连，车机控制数据全丢）。
-            if (running && !manualTeardown && BtSessionGate.sessionActive) {
+            if (owned && running && remoteLoss && BtSessionGate.sessionActive) {
                 BtSessionGate.noteLinkLost(peerAddress)
                 log(
                     "BT-C: CarPlay 会话仍在，但 iAP2 控制链路已断（${peerAddress ?: "地址未知"}）" +
@@ -798,23 +826,34 @@ class Iap2BluetoothClient(
 
     /** 主动结束当前 BT 控制会话（不影响重连循环）。供 AirPlay 配对前复现控制通道退役状态。 */
     fun detachCurrentSession() {
-        // 主动拆的不要被当成「掉线」去补连（否则会立刻把刚退役的控制会话又建回来）
-        manualTeardown = true
-        activeChannel?.let { channel ->
-            activeChannel = null
-            channel.close()
-            log("BT-C: 已主动断开当前控制会话")
-        }
+        retireChannel(activeChannel)
         currentSocket.getAndSet(null)?.let { runCatching { it.close() } }
     }
 
+    /** 绑定至发起该轮尝试时的通道引用，避免延迟兜底误拆新建立的通道。 */
+    fun captureSessionRetirement(): () -> Unit {
+        val captured = activeChannel
+        return { retireChannel(captured) }
+    }
+
+    private fun retireChannel(channel: Iap2LinkChannel?) {
+        if (channel == null) return
+        synchronized(channelLock) {
+            if (activeChannel !== channel) return
+            activeChannel = null
+            senderSession = null
+            BtSessionGate.releaseControl(channel)
+        }
+        channel.close()
+        log("BT-C: 已主动断开本轮控制会话")
+    }
+
+    @Synchronized
     fun stop() {
         running = false
-        // 递增世代：即便有线程卡在 connect()，事后也会因世代不符自杀，不会在下次启动时复活
         generation.incrementAndGet()
         BtSessionGate.clearLinkLost()
-        currentSocket.getAndSet(null)?.let { runCatching { it.close() } }
-        activeChannel?.let { runCatching { it.close() } }
+        detachCurrentSession()
         thread?.interrupt()
         thread = null
         log("BT-C: 已停止")
@@ -828,8 +867,7 @@ class Iap2BluetoothClient(
     }
 
     /** 第 [streak] 次连续失败的退避间隔（0 次 = 基础间隔）。 */
-    private fun backoffMillis(streak: Int): Long =
-        RETRY_BACKOFF_MILLIS[(streak - 1).coerceIn(0, RETRY_BACKOFF_MILLIS.size - 1)]
+    private fun backoffMillis(streak: Int): Long = RETRY_BACKOFF_MILLIS[(streak - 1).coerceIn(0, RETRY_BACKOFF_MILLIS.size - 1)]
 
     /**
      * 退避睡眠：分片检查 [running]，让 stop() 能立刻打断 20 秒的长退避
@@ -841,148 +879,17 @@ class Iap2BluetoothClient(
             sleepQuietly(BACKOFF_POLL_MILLIS)
         }
     }
-}
 
-/**
- * 入站会话门闸：车机主动连入的 iAP2 会话活跃期间，出站客户端暂停连接尝试。
- * 目的：车机通常只有单条无线 iAP2 上下文，双向同时建链会让双方互相干扰。
- */
-object BtSessionGate {
-    /** 入站（车机主动连入）的 iAP2 会话活跃：出站暂停，避免两条 RFCOMM 互相踩。 */
-    @Volatile
-    var inboundActive: Boolean = false
-
-    /**
-     * 最近一次**真正建链**的对端地址（入站或出站都算，null = 还没连上过）。
-     *
-     * 用途：音频配置守卫（[BtProfiles.guardAudioProfiles]）要知道「盯哪台设备」。
-     * 用户指定了目标时直接用目标地址；没指定时（自动选车机）只能靠这里记下的
-     * 实际对端——否则守卫会盯着一台没连上的设备空转。
-     */
-    @Volatile
-    var activePeerAddress: String? = null
-
-    fun notePeerActive(address: String?) {
-        if (address != null) activePeerAddress = address
-    }
-
-    /**
-     * iAP2 会话已跑通 bring-up（发送端会话就绪）。
-     *
-     * 与 [sessionActive]（CarPlay 端点拿到、画面能上）不同：这个更早，只表示车机
-     * 已经认可这条控制链路。音频配置守卫（[BtProfiles.guardAudioProfiles]）
-     * 就是看它来决定「还要不要继续断 HFP/A2DP」——宝马 fork 的结论是 iAP2 一建立
-     * 车机就不再依赖配置文件状态，继续断只是徒增抖动。
-     */
-    @Volatile
-    var iap2Ready: Boolean = false
-
-    /**
-     * CarPlay 会话已建立（任一路径成功拿到端点后置位，由 SessionController 维护）：
-     * 暂停一切出站连接尝试（静默降噪）——典型表现为连着 DiPlay 时不再探测 Audi。
-     * 会话结束/手动断开时由 SessionController 清除。
-     */
-    @Volatile
-    var sessionActive: Boolean = false
-
-    /**
-     * 目标设备软回退：指定了目标车机但连续多轮连不上时置位。
-     *
-     * 场景：用户上次连的是 A 车（配了目标），这次坐的是 B 车 / 测试台。
-     * 旧行为是**死等目标**——出站只试目标、入站把非目标全部掐掉，
-     * 用户体感就是「点了启动连接，四十多秒毫无反应」（2026-10-25 日志实测
-     * 17:48:47 启动 → 17:49:30 才连上）。置位后目标降级为「优先」：
-     * 出站回退到全部已配对设备，入站也不再拒绝。
-     *
-     * 每次 `connect()` 重新开始都会清零，所以真车场景只要目标在窗口内可达，
-     * 行为与旧版完全一致。
-     */
-    @Volatile
-    var targetSoftFallback: Boolean = false
-
-    /**
-     * 「CarPlay 在跑、但我们自己的 iAP2 控制链路掉了」——掉线那一台的地址与时刻。
-     *
-     * 2026-11-04 奥迪 MIB3 实车（`docs/audi-mib3-ea-tunnel-20261104.md`）：BT iAP2 在连上
-     * 约 45 秒后判 `packet 115 not acknowledged` 拆链，而此刻 CarPlay 画面/声音都在跑，
-     * [sessionActive] 于是把出站连接整体静音 —— **整场会话再没人重连控制链路**。
-     * 车机控制面板从头到尾「未连接车机」、歌名/媒体键也全没了，只有手动断开重连才好。
-     *
-     * 静音闸门的本意是「别去骚扰别的接收端」，不是「自己这条链断了也不管」。所以这里
-     * 记下掉线的那台：出站循环在 CarPlay 期间**只对它**重连，连上即清；超过
-     * [LINK_RECOVERY_WINDOW_MILLIS] 还没连回来就认输（打一行日志，回到静音）。
-     */
-    @Volatile
-    var linkLostPeerAddress: String? = null
-
-    /** 掉线时刻（uptimeMillis，0 = 没有待恢复的链路）。 */
-    @Volatile
-    var linkLostAt: Long = 0L
-
-    /** 单条控制链路的恢复窗口：超时后不再拨（CarPlay 本身不受影响）。 */
-    const val LINK_RECOVERY_WINDOW_MILLIS = 180_000L
-
-    /**
-     * 用户手动断开的时刻（uptimeMillis，0 = 本次进程还没手动断过）。
-     *
-     * 为什么要记（2026-11-04 奥迪 4910 / MIB3 4580 实车）：车机固件里
-     * `mediaDisconnectTimeout = 15000ms`——蓝牙断开后要满 15 秒，它才把设备判成
-     * 「已移除」。在那之前 `keepIAP2Session = 1`，车机只走
-     * `IAP2 session already running. Waiting for required IAP2 information.` 这条分支：
-     * **接受 RFCOMM、走完 iAP2 身份交换、下发 0x5703 热点凭据，但不启动 CarPlay
-     * projection**——7000 端口不开、`_airplay._tcp` 不广播、0x4301 不回。
-     *
-     * 那一轮实录：16:22:32.519 手动断开 → 16:22:33.696（**1.2 秒**）重连 → 车机给了
-     * 热点和凭据 → 之后 48 秒里 mDNS 一直是「未发现」，只能拿网关兜底，8 次重连全超时。
-     * 而前一轮（车机主动连入、它自己启动的 projection）10 秒就连上了。
-     *
-     * 所以：手动断开后要给车机留足 [REACTIVATE_COOLDOWN_MILLIS] 再发起。
-     */
-    @Volatile
-    var manualStopAt: Long = 0L
-
-    /**
-     * 手动断开后的重新发起冷却：**必须 > 车机的 mediaDisconnectTimeout（15s）**。
-     * 取 18 秒留 3 秒余量。改小就等于把车机的移除计时器一次次续上，永远停在旧会话上。
-     */
-    const val REACTIVATE_COOLDOWN_MILLIS = 18_000L
-
-    /** 记一次「用户手动断开」。 */
-    fun noteManualStop() {
-        manualStopAt = android.os.SystemClock.uptimeMillis()
-    }
-
-    /** 距上次手动断开多少毫秒；本次进程没手动断过返回 [Long.MAX_VALUE]。 */
-    fun sinceManualStop(): Long {
-        val at = manualStopAt
-        if (at == 0L) return Long.MAX_VALUE
-        return android.os.SystemClock.uptimeMillis() - at
-    }
-
-    /** 记一次「控制链路掉线」，交给出站循环单独重连。 */
-    fun noteLinkLost(address: String?) {
-        if (address == null) return
-        linkLostPeerAddress = address
-        linkLostAt = android.os.SystemClock.uptimeMillis()
-    }
-
-    /** 链路已恢复（或用户已停止）——清掉恢复任务。 */
-    fun clearLinkLost() {
-        linkLostPeerAddress = null
-        linkLostAt = 0L
-    }
-
-    /**
-     * 当前需要恢复的目标地址；null = 不需要（没有掉线 / CarPlay 已结束 / 已超窗）。
-     *
-     * CarPlay 会话结束时 [sessionActive] 会被 SessionController 清掉，这里跟着失效。
-     */
-    fun linkRecoveryTarget(): String? {
-        if (!sessionActive) return null
-        val address = linkLostPeerAddress ?: return null
-        val at = linkLostAt
-        if (at == 0L) return null
-        if (android.os.SystemClock.uptimeMillis() - at > LINK_RECOVERY_WINDOW_MILLIS) return null
-        return address
+    private fun sleepPassiveGrace(
+        millis: Long,
+        myGeneration: Long,
+    ) {
+        val deadline = android.os.SystemClock.uptimeMillis() + millis
+        while (running && generation.get() == myGeneration && android.os.SystemClock.uptimeMillis() < deadline) {
+            if (BtSessionGate.inboundActive || BtSessionGate.sessionActive || BtSessionGate.passiveGraceRemainingMillis() == 0L) {
+                return
+            }
+            sleepQuietly(BACKOFF_POLL_MILLIS)
+        }
     }
 }

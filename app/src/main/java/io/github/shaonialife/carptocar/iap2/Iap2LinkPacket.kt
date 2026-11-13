@@ -103,7 +103,7 @@ object Iap2LinkPacket {
      * 不要合并」。
      *
      * 两种包头共用「FF 5A/55 + u16」，但只有数据帧按帧长切：
-     *  - `FF 5A` 数据帧：头后 u16 = **整帧长度**（9B 头 + 载荷 + 1B 校验），见 [encode]；
+     *  - `FF 5A` 数据帧：头后 u16 = **整帧长度**；空载荷 ACK 只有 9B 头，否则另有载荷与 1B 校验；
      *  - `FF 55` 同步标记：固定 6 字节 `FF 55 02 00 EE 10`。它头后的 `02 00` **不是**
      *    大端帧长（按大端读是 512，按小端读是 2，两种都和 6 字节的实物对不上），
      *    只能按形态识别——它是本项目链路引擎自己产出的唯一 SYN 形态（`MARKER`）。
@@ -114,7 +114,7 @@ object Iap2LinkPacket {
      */
     fun splitFrames(bytes: ByteArray): List<ByteArray> {
         if (bytes.size < 4) return listOf(bytes)
-        val frames = ArrayList<ByteArray>(4)
+        var frames: ArrayList<ByteArray>? = null
         var offset = 0
         while (offset < bytes.size) {
             if (offset + 4 > bytes.size) return listOf(bytes)
@@ -122,17 +122,19 @@ object Iap2LinkPacket {
             val declared = readU16(bytes, offset + 2)
             val frameLength =
                 when (start) {
-                    // 整帧长度。下限 HEADER_BYTES + CHECKSUM_BYTES，否则是脏数据
-                    START_DATA -> declared.takeIf { it >= HEADER_BYTES + CHECKSUM_BYTES } ?: return listOf(bytes)
+                    // 链路引擎的空载荷 ACK 只有头校验和，合法最短帧是 9B
+                    START_DATA -> declared.takeIf { it >= HEADER_BYTES } ?: return listOf(bytes)
                     // 同步标记固定 6 字节，尾部必须是 EE 10（见方法说明）
                     START_SYN -> SYN_MARKER_BYTES.takeIf { canTakeSynMarker(bytes, offset) } ?: return listOf(bytes)
                     else -> return listOf(bytes)
                 }
             if (offset + frameLength > bytes.size) return listOf(bytes)
-            frames += bytes.copyOfRange(offset, offset + frameLength)
+            if (offset == 0 && frameLength == bytes.size) return listOf(bytes)
+            if (frames == null) frames = ArrayList(4)
+            frames.add(bytes.copyOfRange(offset, offset + frameLength))
             offset += frameLength
         }
-        return if (frames.isEmpty()) listOf(bytes) else frames
+        return frames ?: listOf(bytes)
     }
 
     /** 同步标记 `FF 55 02 00 EE 10` 的固定长度。 */
